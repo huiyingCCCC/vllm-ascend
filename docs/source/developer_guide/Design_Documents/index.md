@@ -17,4 +17,5 @@ context_parallel
 dynamic_chunked_pipeline_parallel
 quantization
 npugraph_ex
+deepseek_v4_dspark
 :::
