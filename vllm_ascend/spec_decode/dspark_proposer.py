@@ -243,6 +243,14 @@ class AscendDSparkProposer(AscendDflashProposer):
             )
         self.kv_cache_gid = matching_group_ids.pop()
         cache_group = kv_cache_config.kv_cache_groups[self.kv_cache_gid]
+        grouped_dspark_layers = {
+            layer_name for layer_name in cache_group.layer_names if layer_name in cache_layer_names
+        }
+        if grouped_dspark_layers != set(cache_layer_names):
+            raise ValueError(
+                "DSpark PD cache layers and the block-table cache group must match exactly: "
+                f"draft layers={cache_layer_names}, group {self.kv_cache_gid} layers={cache_group.layer_names}"
+            )
         cache_spec = cache_group.kv_cache_spec
         if hasattr(cache_spec, "kv_cache_specs"):
             cache_spec = cache_spec.kv_cache_specs[cache_layer_names[0]]
@@ -265,6 +273,37 @@ class AscendDSparkProposer(AscendDflashProposer):
         self.attn_layer_names = cache_layer_names
         self.piece_all_attn_layer_name = [[] for _ in range(self.num_speculative_tokens)]
         self.draft_attn_groups = []
+
+    def _get_dspark_group_cache_metadata(
+        self,
+        cad: CommonAttentionMetadata | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.runner is None or not hasattr(self.runner, "input_batch"):
+            raise RuntimeError("DSpark cache-group metadata requires an initialized model runner input batch.")
+        block_tables = self.runner.input_batch.block_table
+        if self.kv_cache_gid >= len(block_tables):
+            raise AssertionError(
+                f"DSpark KV cache group {self.kv_cache_gid} has no input-batch block table "
+                f"(available groups: {len(block_tables)})."
+            )
+
+        group_block_table = block_tables[self.kv_cache_gid]
+        block_table_tensor = group_block_table.get_device_tensor()
+        slot_mapping = group_block_table.slot_mapping.gpu
+        if cad is not None and not bool(getattr(self.runner, "use_cp", False)):
+            cad_block_table = getattr(cad, "block_table_tensor", None)
+            if cad_block_table is not None and cad_block_table.data_ptr() != block_table_tensor.data_ptr():
+                raise AssertionError(
+                    "DSpark received attention metadata from a different KV cache group: "
+                    f"expected group {self.kv_cache_gid} block table."
+                )
+            cad_slot_mapping = getattr(cad, "slot_mapping", None)
+            if cad_slot_mapping is not None and cad_slot_mapping.data_ptr() != slot_mapping.data_ptr():
+                raise AssertionError(
+                    "DSpark received slot mapping from a different KV cache group: "
+                    f"expected group {self.kv_cache_gid} slot mapping."
+                )
+        return block_table_tensor, slot_mapping
 
     @torch.inference_mode()
     def dummy_run(
@@ -453,6 +492,7 @@ class AscendDSparkProposer(AscendDflashProposer):
     ) -> tuple[int, torch.Tensor | None, CommonAttentionMetadata, tuple[Any, Any] | None]:
         is_prefill = num_decode_reqs == 0 and num_prefill_reqs > 0
         batch_size = cad.num_reqs
+        dspark_block_table, dspark_slot_mapping = self._get_dspark_group_cache_metadata(cad)
         self._dspark_context_lens = cad.seq_lens[:batch_size].clone()
         block_size = self.num_speculative_tokens
         num_query_total = batch_size * block_size
@@ -486,17 +526,14 @@ class AscendDSparkProposer(AscendDflashProposer):
                 target_positions[:num_context].to(self._context_positions_buffer.dtype),
                 invalid_context_position.to(self._context_positions_buffer.dtype),
             )
-            if getattr(cad, "slot_mapping", None) is not None:
-                self._context_slot_mapping_buffer[:num_context] = torch.where(
-                    valid_context_mask,
-                    cad.slot_mapping[:num_context].to(self._context_slot_mapping_buffer.dtype),
-                    torch.full_like(self._context_slot_mapping_buffer[:num_context], -1),
-                )
-            else:
-                self._context_slot_mapping_buffer[:num_context].fill_(-1)
+            self._context_slot_mapping_buffer[:num_context] = torch.where(
+                valid_context_mask,
+                dspark_slot_mapping[:num_context].to(self._context_slot_mapping_buffer.dtype),
+                torch.full_like(self._context_slot_mapping_buffer[:num_context], -1),
+            )
         if is_prefill:
             self._copy_dspark_block_table(
-                getattr(cad, "block_table_tensor", None),
+                dspark_block_table,
                 self._dspark_context_lens,
             )
             return num_query_total, None, cad, None
@@ -509,7 +546,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         # bounds and for the DSpark attention sequence lengths.
         self._dspark_context_lens = last_positions + 1
         self._copy_dspark_block_table(
-            getattr(cad, "block_table_tensor", None),
+            dspark_block_table,
             self._dspark_context_lens,
         )
         draft_offsets = self.arange_dflash[:block_size].view(1, block_size)
@@ -526,13 +563,10 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._request_slots_buffer[:num_query_total] = (
             request_slots_tensor.view(batch_size, 1).expand(-1, block_size).flatten()
         )
-        if getattr(cad, "block_table_tensor", None) is not None:
-            block_nums = draft_positions // self.kernel_block_size
-            block_offsets = draft_positions % self.kernel_block_size
-            block_ids = torch.gather(cad.block_table_tensor[:batch_size], 1, block_nums.to(torch.int64))
-            slot_mapping = block_ids.to(torch.int32) * self.kernel_block_size + block_offsets
-        else:
-            slot_mapping = draft_positions.to(torch.int32)
+        block_nums = draft_positions // self.kernel_block_size
+        block_offsets = draft_positions % self.kernel_block_size
+        block_ids = torch.gather(dspark_block_table[:batch_size], 1, block_nums.to(torch.int64))
+        slot_mapping = block_ids.to(torch.int32) * self.kernel_block_size + block_offsets
         slot_mapping = torch.where(
             exceeds_max_model_len,
             torch.full_like(slot_mapping, -1),
