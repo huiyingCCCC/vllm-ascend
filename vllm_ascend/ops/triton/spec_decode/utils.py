@@ -15,6 +15,7 @@
 #
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/spec_decode/utils.py
 
+import torch
 from vllm.triton_utils import tl, triton
 
 
@@ -138,3 +139,245 @@ def copy_and_expand_dflash_inputs_kernel_single_grid(
 
                 sample_out_idx = req_idx * num_speculative_tokens + (q_idx - 1)
                 tl.store(out_token_indices_ptr + sample_out_idx, query_out_idx)
+
+
+@triton.jit
+def store_dspark_context_kv_kernel(
+    shared_kv_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    request_slots_ptr,
+    paged_cache_ptr,
+    ring_cache_ptr,
+    cache_positions_ptr,
+    shared_kv_stride,
+    shared_kv_head_stride,
+    paged_cache_block_stride,
+    paged_cache_token_stride,
+    paged_cache_head_stride,
+    ring_cache_request_stride,
+    ring_cache_token_stride,
+    ring_cache_head_stride,
+    cache_positions_request_stride,
+    num_tokens,
+    head_dim,
+    num_paged_blocks,
+    paged_block_size,
+    num_request_slots,
+    window_size,
+    STORE_RING: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+    head_offsets = head_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_valid = head_offsets < head_dim
+
+    position = tl.load(positions_ptr + token_idx)
+    slot = tl.load(slot_mapping_ptr + token_idx)
+    page_block = slot // paged_block_size
+    page_offset = slot % paged_block_size
+    page_valid = (
+        (token_idx < num_tokens)
+        & (position >= 0)
+        & (slot >= 0)
+        & (page_block < num_paged_blocks)
+    )
+    shared_kv = tl.load(
+        shared_kv_ptr
+        + token_idx * shared_kv_stride
+        + head_offsets * shared_kv_head_stride,
+        mask=page_valid & head_valid,
+        other=0.0,
+    )
+    tl.store(
+        paged_cache_ptr
+        + page_block * paged_cache_block_stride
+        + page_offset * paged_cache_token_stride
+        + head_offsets * paged_cache_head_stride,
+        shared_kv,
+        mask=page_valid & head_valid,
+    )
+
+    if STORE_RING:
+        request_slot = tl.load(request_slots_ptr + token_idx)
+        ring_offset = position % window_size
+        ring_valid = page_valid & (request_slot >= 0) & (request_slot < num_request_slots)
+        tl.store(
+            ring_cache_ptr
+            + request_slot * ring_cache_request_stride
+            + ring_offset * ring_cache_token_stride
+            + head_offsets * ring_cache_head_stride,
+            shared_kv,
+            mask=ring_valid & head_valid,
+        )
+        tl.store(
+            cache_positions_ptr + request_slot * cache_positions_request_stride + ring_offset,
+            position,
+            mask=ring_valid & (head_offsets == 0),
+        )
+
+
+def store_dspark_context_kv(
+    shared_kv: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_cache: torch.Tensor,
+    ring_cache: torch.Tensor,
+    cache_positions: torch.Tensor,
+    request_slots: torch.Tensor | None,
+) -> None:
+    num_tokens = positions.numel()
+    if num_tokens == 0:
+        return
+    paged_tokens = paged_cache.flatten(start_dim=2)
+    head_dim = ring_cache.shape[-1]
+    block_h = 128
+    store_dspark_context_kv_kernel[(num_tokens, triton.cdiv(head_dim, block_h))](
+        shared_kv_ptr=shared_kv,
+        positions_ptr=positions,
+        slot_mapping_ptr=slot_mapping,
+        request_slots_ptr=request_slots if request_slots is not None else 0,
+        paged_cache_ptr=paged_tokens,
+        ring_cache_ptr=ring_cache,
+        cache_positions_ptr=cache_positions,
+        shared_kv_stride=shared_kv.stride(0),
+        shared_kv_head_stride=shared_kv.stride(-1),
+        paged_cache_block_stride=paged_tokens.stride(0),
+        paged_cache_token_stride=paged_tokens.stride(1),
+        paged_cache_head_stride=paged_tokens.stride(2),
+        ring_cache_request_stride=ring_cache.stride(0),
+        ring_cache_token_stride=ring_cache.stride(1),
+        ring_cache_head_stride=ring_cache.stride(2),
+        cache_positions_request_stride=cache_positions.stride(0),
+        num_tokens=num_tokens,
+        head_dim=head_dim,
+        num_paged_blocks=paged_tokens.shape[0],
+        paged_block_size=paged_tokens.shape[1],
+        num_request_slots=ring_cache.shape[0],
+        window_size=ring_cache.shape[1],
+        STORE_RING=request_slots is not None,
+        BLOCK_H=block_h,
+    )
+
+
+@triton.jit
+def restore_dspark_context_cache_kernel(
+    paged_cache_ptr,
+    block_table_ptr,
+    context_lens_ptr,
+    request_slots_ptr,
+    ring_cache_ptr,
+    cache_positions_ptr,
+    paged_cache_block_stride,
+    paged_cache_token_stride,
+    paged_cache_head_stride,
+    block_table_stride,
+    ring_cache_request_stride,
+    ring_cache_token_stride,
+    ring_cache_head_stride,
+    cache_positions_request_stride,
+    batch_size,
+    block_table_cols,
+    head_dim,
+    num_paged_blocks,
+    paged_block_size,
+    num_request_slots,
+    window_size,
+    BLOCK_H: tl.constexpr,
+):
+    request_idx = tl.program_id(0)
+    window_offset = tl.program_id(1)
+    head_block_idx = tl.program_id(2)
+    head_offsets = head_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_valid = head_offsets < head_dim
+
+    context_len = tl.load(context_lens_ptr + request_idx)
+    request_slot = tl.load(request_slots_ptr + request_idx)
+    position = context_len - window_size + window_offset
+    position_valid = (
+        (request_idx < batch_size)
+        & (position >= 0)
+        & (position < context_len)
+        & (request_slot >= 0)
+        & (request_slot < num_request_slots)
+    )
+    block_number = position // paged_block_size
+    table_valid = position_valid & (block_number >= 0) & (block_number < block_table_cols)
+    block_id = tl.load(
+        block_table_ptr + request_idx * block_table_stride + block_number,
+        mask=table_valid,
+        other=-1,
+    )
+    page_valid = table_valid & (block_id >= 0) & (block_id < num_paged_blocks)
+    ring_offset = position % window_size
+    stored_position = tl.load(
+        cache_positions_ptr + request_slot * cache_positions_request_stride + ring_offset,
+        mask=page_valid,
+        other=-1,
+    )
+    restore_required = page_valid & (stored_position != position)
+    page_offset = position % paged_block_size
+    context_kv = tl.load(
+        paged_cache_ptr
+        + block_id * paged_cache_block_stride
+        + page_offset * paged_cache_token_stride
+        + head_offsets * paged_cache_head_stride,
+        mask=restore_required & head_valid,
+        other=0.0,
+    )
+    tl.store(
+        ring_cache_ptr
+        + request_slot * ring_cache_request_stride
+        + ring_offset * ring_cache_token_stride
+        + head_offsets * ring_cache_head_stride,
+        context_kv,
+        mask=restore_required & head_valid,
+    )
+    tl.store(
+        cache_positions_ptr + request_slot * cache_positions_request_stride + ring_offset,
+        position,
+        mask=restore_required & (head_offsets == 0),
+    )
+
+
+def restore_dspark_context_cache(
+    paged_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    request_slots: torch.Tensor,
+    ring_cache: torch.Tensor,
+    cache_positions: torch.Tensor,
+) -> None:
+    batch_size = min(block_table.shape[0], context_lens.numel(), request_slots.numel())
+    if batch_size == 0:
+        return
+    paged_tokens = paged_cache.flatten(start_dim=2)
+    head_dim = ring_cache.shape[-1]
+    block_h = 128
+    restore_dspark_context_cache_kernel[
+        (batch_size, ring_cache.shape[1], triton.cdiv(head_dim, block_h))
+    ](
+        paged_cache_ptr=paged_tokens,
+        block_table_ptr=block_table,
+        context_lens_ptr=context_lens,
+        request_slots_ptr=request_slots,
+        ring_cache_ptr=ring_cache,
+        cache_positions_ptr=cache_positions,
+        paged_cache_block_stride=paged_tokens.stride(0),
+        paged_cache_token_stride=paged_tokens.stride(1),
+        paged_cache_head_stride=paged_tokens.stride(2),
+        block_table_stride=block_table.stride(0),
+        ring_cache_request_stride=ring_cache.stride(0),
+        ring_cache_token_stride=ring_cache.stride(1),
+        ring_cache_head_stride=ring_cache.stride(2),
+        cache_positions_request_stride=cache_positions.stride(0),
+        batch_size=batch_size,
+        block_table_cols=block_table.shape[1],
+        head_dim=head_dim,
+        num_paged_blocks=paged_tokens.shape[0],
+        paged_block_size=paged_tokens.shape[1],
+        num_request_slots=ring_cache.shape[0],
+        window_size=ring_cache.shape[1],
+        BLOCK_H=block_h,
+    )
