@@ -67,6 +67,33 @@ class AscendDSparkProposer(AscendDflashProposer):
         self.positions = torch.zeros(self.max_query_tokens, dtype=torch.int32, device=self.device)
         self._slot_mapping_buffer = torch.zeros(self.max_query_tokens, dtype=torch.int32, device=self.device)
         self._request_slots_buffer = torch.zeros(self.max_query_tokens, dtype=torch.int32, device=self.device)
+        self._request_slots_by_req_buffer = torch.zeros(
+            self.max_graph_batch_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._reset_request_slots_buffer = torch.zeros(
+            self.max_graph_batch_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._request_slots_cpu_buffer = torch.zeros(
+            self.max_graph_batch_size,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        self._request_slots_cpu_np = self._request_slots_cpu_buffer.numpy()
+        self._reset_request_slots_cpu_buffer = torch.zeros(
+            self.max_graph_batch_size,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        self._reset_request_slots_cpu_np = self._reset_request_slots_cpu_buffer.numpy()
+        self._query_start_loc_cpu = (
+            torch.arange(self.max_graph_batch_size + 1, dtype=torch.int32, device="cpu") * block_size
+        )
+        self._actual_seq_lengths_q_cache: dict[int, list[int]] = {}
+        self._batch_descriptor_cache: dict[tuple[int, bool, int], BatchDescriptor] = {}
         self._dspark_window_offsets = torch.arange(self._dspark_window_size, dtype=torch.int64, device=self.device).view(
             1, -1
         )
@@ -85,6 +112,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._dspark_capture_sizes: list[int] = []
         self._dspark_block_table_buffer: torch.Tensor | None = None
         self._dspark_block_table_tensor: torch.Tensor | None = None
+        self._dspark_block_indices: torch.Tensor | None = None
         scheduler_config = getattr(vllm_config, "scheduler_config", None)
         self._dspark_max_request_slots = max(
             1, int(getattr(scheduler_config, "max_num_seqs", self.max_batch_size) or self.max_batch_size)
@@ -270,6 +298,11 @@ class AscendDSparkProposer(AscendDflashProposer):
             device=self.device,
         )
         self._dspark_block_table_tensor = self._dspark_block_table_buffer
+        self._dspark_block_indices = torch.arange(
+            max_num_blocks,
+            dtype=torch.int64,
+            device=self.device,
+        ).view(1, -1)
         self._draft_attn_layer_names = set(cache_layer_names)
         self.attn_layer_names = cache_layer_names
         self.piece_all_attn_layer_name = [[] for _ in range(self.num_speculative_tokens)]
@@ -413,20 +446,27 @@ class AscendDSparkProposer(AscendDflashProposer):
     ) -> BatchDescriptor | None:
         if base_descriptor is None:
             return None
-        return BatchDescriptor(
-            num_tokens=num_reqs * self.num_speculative_tokens,
-            num_reqs=num_reqs,
-            uniform=False,
-            has_lora=base_descriptor.has_lora,
-            num_active_loras=base_descriptor.num_active_loras,
-        )
+        key = (num_reqs, base_descriptor.has_lora, base_descriptor.num_active_loras)
+        descriptor = self._batch_descriptor_cache.get(key)
+        if descriptor is None:
+            descriptor = BatchDescriptor(
+                num_tokens=num_reqs * self.num_speculative_tokens,
+                num_reqs=num_reqs,
+                uniform=False,
+                has_lora=base_descriptor.has_lora,
+                num_active_loras=base_descriptor.num_active_loras,
+            )
+            self._batch_descriptor_cache[key] = descriptor
+        return descriptor
 
     def get_aclgraph_capture_sizes(self, capture_sizes: list[int]) -> list[int]:
         return self._dspark_capture_sizes
 
-    def _assign_request_slots(self, batch_size: int) -> list[int]:
+    def _assign_request_slots(self, batch_size: int) -> torch.Tensor:
+        request_slots = self._request_slots_by_req_buffer[:batch_size]
         if self.runner is None or not hasattr(self.runner, "input_batch"):
-            return list(range(batch_size))
+            request_slots.copy_(self.arange_dflash[:batch_size])
+            return request_slots
         input_batch = self.runner.input_batch
         req_ids = list(input_batch.req_ids[:batch_size])
         active_req_ids = set(input_batch.req_ids[: input_batch.num_reqs])
@@ -437,17 +477,17 @@ class AscendDSparkProposer(AscendDflashProposer):
             if slot not in self._dspark_free_slots:
                 self._dspark_free_slots.append(slot)
         self._dspark_free_slots.sort()
-        slots: list[int] = []
         self._dspark_slots_to_reset = []
-        for req_id in req_ids:
+        for req_idx, req_id in enumerate(req_ids):
             if req_id not in self._dspark_req_id_to_slot:
                 if not self._dspark_free_slots:
                     raise ValueError("No free DSpark request cache slots")
                 slot = self._dspark_free_slots.pop(0)
                 self._dspark_req_id_to_slot[req_id] = slot
                 self._dspark_slots_to_reset.append(slot)
-            slots.append(self._dspark_req_id_to_slot[req_id])
-        return slots
+            self._request_slots_cpu_np[req_idx] = self._dspark_req_id_to_slot[req_id]
+        request_slots.copy_(self._request_slots_cpu_buffer[:batch_size], non_blocking=True)
+        return request_slots
 
     def _copy_dspark_block_table(
         self,
@@ -476,7 +516,8 @@ class AscendDSparkProposer(AscendDflashProposer):
                 self.kernel_block_size,
                 rounding_mode="floor",
             )
-            block_indices = torch.arange(num_cols, device=block_table_buffer.device).view(1, -1)
+            assert self._dspark_block_indices is not None
+            block_indices = self._dspark_block_indices[:, :num_cols]
             invalid_blocks = block_indices >= valid_block_counts.view(-1, 1)
             active_block_table.masked_fill_(invalid_blocks, -1)
         self._dspark_block_table_tensor = block_table_buffer
@@ -500,8 +541,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._dspark_context_lens = cad.seq_lens[:batch_size].clone()
         block_size = self.num_speculative_tokens
         num_query_total = batch_size * block_size
-        request_slots = self._assign_request_slots(batch_size)
-        request_slots_tensor = torch.tensor(request_slots, dtype=torch.int32, device=self.device)
+        request_slots_tensor = self._assign_request_slots(batch_size)
         self._dspark_context_request_slots = request_slots_tensor
         has_num_rejected = num_rejected_tokens_gpu is not None
         query_start_loc = cad.query_start_loc[: batch_size + 1]
@@ -581,11 +621,13 @@ class AscendDSparkProposer(AscendDflashProposer):
         cad.seq_lens = self._dspark_context_lens + block_size
         if max_model_len > 0:
             cad.seq_lens = cad.seq_lens.clamp(max=max_model_len)
-        cad.query_start_loc_cpu = (torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * block_size).to(
-            torch.int32
-        )
+        cad.query_start_loc_cpu = self._query_start_loc_cpu[: batch_size + 1]
         if hasattr(cad, "actual_seq_lengths_q"):
-            cad.actual_seq_lengths_q = [block_size] * batch_size
+            actual_seq_lengths_q = self._actual_seq_lengths_q_cache.get(batch_size)
+            if actual_seq_lengths_q is None:
+                actual_seq_lengths_q = [block_size] * batch_size
+                self._actual_seq_lengths_q_cache[batch_size] = actual_seq_lengths_q
+            cad.actual_seq_lengths_q = actual_seq_lengths_q
         if hasattr(cad, "decode_token_per_req"):
             cad.decode_token_per_req = block_size
         cad.num_actual_tokens = num_query_total
@@ -659,7 +701,10 @@ class AscendDSparkProposer(AscendDflashProposer):
     def _reset_pending_request_slots(self) -> None:
         if not self._dspark_slots_to_reset:
             return
-        reset_slots = torch.tensor(self._dspark_slots_to_reset, dtype=torch.int32, device=self.device)
+        num_reset_slots = len(self._dspark_slots_to_reset)
+        self._reset_request_slots_cpu_np[:num_reset_slots] = self._dspark_slots_to_reset
+        reset_slots = self._reset_request_slots_buffer[:num_reset_slots]
+        reset_slots.copy_(self._reset_request_slots_cpu_buffer[:num_reset_slots], non_blocking=True)
         self.model.reset_request_slots(reset_slots)
         self._dspark_slots_to_reset = []
 
