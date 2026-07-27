@@ -13,6 +13,9 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
+from vllm_ascend.ops.triton.spec_decode.utils import (
+    copy_and_expand_dspark_inputs_kernel_single_grid,
+)
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.llm_base_proposer import greedy_sample
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
@@ -91,6 +94,24 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._reset_request_slots_cpu_np = self._reset_request_slots_cpu_buffer.numpy()
         self._query_start_loc_cpu = (
             torch.arange(self.max_graph_batch_size + 1, dtype=torch.int32, device="cpu") * block_size
+        )
+        self._query_start_loc_buffer = (
+            torch.arange(self.max_graph_batch_size + 1, dtype=torch.int32, device=self.device) * block_size
+        )
+        self._context_request_slots_buffer = torch.zeros(
+            self.max_num_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._context_lens_buffer = torch.zeros(
+            self.max_graph_batch_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._seq_lens_buffer = torch.zeros(
+            self.max_graph_batch_size,
+            dtype=torch.int32,
+            device=self.device,
         )
         self._actual_seq_lengths_q_cache: dict[int, list[int]] = {}
         self._batch_descriptor_cache: dict[tuple[int, bool, int], BatchDescriptor] = {}
@@ -384,6 +405,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         context_positions = self._context_positions_buffer[:num_context]
         context_positions.copy_(self.arange_dflash[:num_context])
         self._context_slot_mapping_buffer[:num_context].copy_(self.arange_dflash[:num_context])
+        self._context_request_slots_buffer[:num_context].zero_()
         self._dflash_num_context = num_context
         if num_input_tokens % block_size != 0:
             raise ValueError(
@@ -538,89 +560,60 @@ class AscendDSparkProposer(AscendDflashProposer):
         is_prefill = num_decode_reqs == 0 and num_prefill_reqs > 0
         batch_size = cad.num_reqs
         dspark_block_table, dspark_slot_mapping = self._get_dspark_group_cache_metadata(cad)
-        self._dspark_context_lens = cad.seq_lens[:batch_size].clone()
         block_size = self.num_speculative_tokens
         num_query_total = batch_size * block_size
         request_slots_tensor = self._assign_request_slots(batch_size)
         self._dspark_context_request_slots = request_slots_tensor
         has_num_rejected = num_rejected_tokens_gpu is not None
         query_start_loc = cad.query_start_loc[: batch_size + 1]
-        query_start = query_start_loc[:-1]
-        query_end = query_start_loc[1:]
-        if has_num_rejected:
-            assert num_rejected_tokens_gpu is not None
-            valid_query_end = query_end - num_rejected_tokens_gpu[:batch_size].to(query_end.dtype)
-        else:
-            valid_query_end = query_end
-        valid_query_end = torch.maximum(query_start, valid_query_end)
 
         num_context = min(target_token_ids.shape[0], target_hidden_states.shape[0], target_positions.shape[0])
         self._dflash_num_context = num_context
         if num_context > 0:
-            context_token_indices = self.arange_dflash[:num_context]
-            context_req_indices = torch.searchsorted(query_end, context_token_indices, right=True).to(torch.int64)
-            context_req_indices = torch.clamp(context_req_indices, max=batch_size - 1)
-            valid_context_end = valid_query_end.index_select(0, context_req_indices)
-            valid_context_mask = context_token_indices < valid_context_end
-            invalid_context_position = torch.full_like(target_positions[:num_context], -1)
-
             self._dflash_hidden_states[:num_context] = target_hidden_states[:num_context]
-            self._context_positions_buffer[:num_context] = torch.where(
-                valid_context_mask,
-                target_positions[:num_context].to(self._context_positions_buffer.dtype),
-                invalid_context_position.to(self._context_positions_buffer.dtype),
-            )
-            self._context_slot_mapping_buffer[:num_context] = torch.where(
-                valid_context_mask,
-                dspark_slot_mapping[:num_context].to(self._context_slot_mapping_buffer.dtype),
-                torch.full_like(self._context_slot_mapping_buffer[:num_context], -1),
-            )
+
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+        copy_and_expand_dspark_inputs_kernel_single_grid[1,](
+            next_token_ids_ptr=next_token_ids,
+            target_positions_ptr=target_positions,
+            context_slot_mapping_ptr=dspark_slot_mapping,
+            request_slots_ptr=request_slots_tensor,
+            out_input_ids_ptr=self.input_ids,
+            out_context_positions_ptr=self._context_positions_buffer,
+            out_context_slot_mapping_ptr=self._context_slot_mapping_buffer,
+            out_context_request_slots_ptr=self._context_request_slots_buffer,
+            out_query_positions_ptr=self.positions,
+            out_query_slot_mapping_ptr=self._slot_mapping_buffer,
+            out_query_request_slots_ptr=self._request_slots_buffer,
+            out_context_lens_ptr=self._context_lens_buffer,
+            out_seq_lens_ptr=self._seq_lens_buffer,
+            block_table_ptr=dspark_block_table,
+            block_table_stride=dspark_block_table.stride(0),
+            query_start_loc_ptr=query_start_loc,
+            num_rejected_tokens_ptr=(num_rejected_tokens_gpu if has_num_rejected else 0),
+            parallel_drafting_token_id=self.parallel_drafting_token_id,
+            cache_block_size=self.kernel_block_size,
+            draft_len=block_size,
+            total_input_tokens=num_context,
+            batch_size=batch_size,
+            max_model_len=max_model_len,
+            HAS_NUM_REJECTED=has_num_rejected,
+            HAS_MAX_MODEL_LEN=max_model_len > 0,
+        )
+        self._dspark_context_lens = self._context_lens_buffer[:batch_size]
         if is_prefill:
             self._copy_dspark_block_table(
                 dspark_block_table,
                 self._dspark_context_lens,
             )
             return num_query_total, None, cad, None
-        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
-        last_token_indices = torch.clamp(valid_query_end - 1, min=0, max=target_positions.shape[0] - 1).to(torch.int64)
-        last_positions = target_positions.index_select(0, last_token_indices).to(self.positions.dtype)
-        # The target metadata is optimistic and can still include rejected
-        # draft tokens. Use the last valid target position for paged-cache
-        # bounds and for the DSpark attention sequence lengths.
-        self._dspark_context_lens = last_positions + 1
         self._copy_dspark_block_table(
             dspark_block_table,
             self._dspark_context_lens,
         )
-        draft_offsets = self.arange_dflash[:block_size].view(1, block_size)
-        draft_positions = last_positions.view(batch_size, 1) + 1 + draft_offsets
-        if max_model_len > 0:
-            exceeds_max_model_len = draft_positions >= max_model_len
-            draft_positions = torch.where(exceeds_max_model_len, torch.zeros_like(draft_positions), draft_positions)
-        else:
-            exceeds_max_model_len = torch.zeros_like(draft_positions, dtype=torch.bool)
-        self.positions[:num_query_total] = draft_positions.flatten()
-        input_ids_view = self.input_ids[:num_query_total].view(batch_size, block_size)
-        input_ids_view.fill_(self.parallel_drafting_token_id)
-        input_ids_view[:, 0].copy_(next_token_ids[:batch_size])
-        self._request_slots_buffer[:num_query_total] = (
-            request_slots_tensor.view(batch_size, 1).expand(-1, block_size).flatten()
-        )
-        block_nums = draft_positions // self.kernel_block_size
-        block_offsets = draft_positions % self.kernel_block_size
-        block_ids = torch.gather(dspark_block_table[:batch_size], 1, block_nums.to(torch.int64))
-        slot_mapping = block_ids.to(torch.int32) * self.kernel_block_size + block_offsets
-        slot_mapping = torch.where(
-            exceeds_max_model_len,
-            torch.full_like(slot_mapping, -1),
-            slot_mapping,
-        )
-        self._slot_mapping_buffer[:num_query_total] = slot_mapping.flatten()
-        cad.query_start_loc = self.arange_dflash[: batch_size + 1] * block_size
-        cad.seq_lens = self._dspark_context_lens + block_size
-        if max_model_len > 0:
-            cad.seq_lens = cad.seq_lens.clamp(max=max_model_len)
+        cad.query_start_loc = self._query_start_loc_buffer[: batch_size + 1]
+        cad.seq_lens = self._seq_lens_buffer[:batch_size]
         cad.query_start_loc_cpu = self._query_start_loc_cpu[: batch_size + 1]
         if hasattr(cad, "actual_seq_lengths_q"):
             actual_seq_lengths_q = self._actual_seq_lengths_q_cache.get(batch_size)
@@ -720,6 +713,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             self._dflash_hidden_states[:num_context],
             self._context_positions_buffer[:num_context],
             self._context_slot_mapping_buffer[:num_context],
+            self._context_request_slots_buffer[:num_context],
         )
         self.model.model.sync_context_cache_from_paged(
             self._dspark_block_table_tensor,

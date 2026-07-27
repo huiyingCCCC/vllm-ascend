@@ -28,10 +28,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
-from vllm_ascend.ops.triton.spec_decode.utils import (
-    restore_dspark_context_cache,
-    store_dspark_context_kv,
-)
 from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp, get_ascend_device_type
 
 from .deepseek_v4 import (
@@ -303,7 +299,6 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         positions: torch.Tensor,
         slot_mapping: torch.Tensor | None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
-        request_slots: torch.Tensor | None = None,
     ) -> None:
         if positions.numel() == 0:
             return
@@ -317,15 +312,17 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             # KV caches are not bound during the memory profiling dummy run.
             return
 
-        store_dspark_context_kv(
-            shared_kv,
-            positions,
-            slot_mapping,
-            kv_cache,
-            self._dspark_kv_cache,
-            self._dspark_cache_positions,
-            request_slots,
-        )
+        cache_tokens = kv_cache.flatten(start_dim=2)
+        cache_block_size = kv_cache.shape[1]
+        slots_int64 = slot_mapping.to(device=shared_kv.device, dtype=torch.int64)
+        block_ids = torch.div(slots_int64, cache_block_size, rounding_mode="floor")
+        block_offsets = slots_int64.remainder(cache_block_size)
+        valid &= block_ids < kv_cache.shape[0]
+        flat_valid = valid.reshape(-1)
+        flat_block_ids = block_ids.reshape(-1)[flat_valid]
+        flat_block_offsets = block_offsets.reshape(-1)[flat_valid]
+        flat_shared_kv = shared_kv.reshape(-1, shared_kv.shape[-1])[flat_valid]
+        cache_tokens[flat_block_ids, flat_block_offsets, : self.head_dim] = flat_shared_kv.to(cache_tokens.dtype)
 
     def sync_context_cache_from_paged(
         self,
@@ -338,14 +335,43 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         if kv_cache is None or block_table is None or context_lens is None or request_slots is None:
             return
 
-        restore_dspark_context_cache(
-            kv_cache,
-            block_table,
-            context_lens,
-            request_slots,
-            self._dspark_kv_cache,
-            self._dspark_cache_positions,
+        batch_size = min(block_table.shape[0], context_lens.numel(), request_slots.numel())
+        if batch_size == 0:
+            return
+        context_lens = context_lens[:batch_size].to(device=kv_cache.device, dtype=torch.int64)
+        request_slots = request_slots[:batch_size].to(device=kv_cache.device, dtype=torch.int64)
+        context_end = context_lens.view(-1, 1) - 1
+        context_positions = context_end + 1 - self.window_size + self._dspark_window_offsets
+        position_valid = (context_positions >= 0) & (context_positions <= context_end)
+
+        cache_block_size = kv_cache.shape[1]
+        block_numbers = torch.div(
+            context_positions.clamp_min(0),
+            cache_block_size,
+            rounding_mode="floor",
         )
+        table_valid = block_numbers < block_table.shape[1]
+        safe_block_numbers = block_numbers.clamp(max=block_table.shape[1] - 1)
+        block_ids = block_table[:batch_size].gather(1, safe_block_numbers).to(torch.int64)
+        cache_valid = position_valid & table_valid & (block_ids >= 0) & (block_ids < kv_cache.shape[0])
+        safe_block_ids = block_ids.clamp(min=0, max=kv_cache.shape[0] - 1)
+        block_offsets = context_positions.clamp_min(0).remainder(cache_block_size)
+        paged_tokens = kv_cache.flatten(start_dim=2)
+        context_kv = paged_tokens[safe_block_ids, block_offsets, : self.head_dim]
+
+        self._dspark_kv_cache[request_slots] = 0
+        self._dspark_cache_positions[request_slots] = -1
+        slot_indices = request_slots.view(-1, 1).expand_as(context_positions)
+        cache_indices = context_positions.clamp_min(0).remainder(self.window_size)
+        flat_valid = cache_valid.reshape(-1)
+        self._dspark_kv_cache[
+            slot_indices.reshape(-1)[flat_valid],
+            cache_indices.reshape(-1)[flat_valid],
+        ] = context_kv.reshape(-1, self.head_dim)[flat_valid].to(self._dspark_kv_cache.dtype)
+        self._dspark_cache_positions[
+            slot_indices.reshape(-1)[flat_valid],
+            cache_indices.reshape(-1)[flat_valid],
+        ] = context_positions.to(torch.int32).reshape(-1)[flat_valid]
 
     def _get_dspark_fused_attention_metadata(
         self,
@@ -443,12 +469,6 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             context_request_slots = (
                 request_slots[:, :1].to(device=draft_kv.device, dtype=torch.int64).expand(-1, self.window_size)
             )
-        else:
-            context_end = draft_positions[:, :1].to(torch.int64) - 1
-            context_start = torch.clamp(context_end + 1 - self.window_size, min=0)
-            ctx_positions = context_start + self._dspark_window_offsets
-        stored_positions = self._dspark_cache_positions[context_request_slots, context_cache_indices]
-        context_cache_valid = context_cache_valid & stored_positions.eq(ctx_positions)
         ctx_kv = self._dspark_kv_cache[context_request_slots, context_cache_indices]
         ctx_kv = torch.where(context_cache_valid.unsqueeze(-1), ctx_kv, torch.zeros_like(ctx_kv))
 
@@ -716,7 +736,6 @@ class DeepseekV4DSparkModel(nn.Module):
                 context_positions,
                 context_slot_mapping,
                 rope_cos_sin,
-                context_request_slots,
             )
 
     def reset_request_slots(self, request_slots: torch.Tensor | None) -> None:
@@ -898,7 +917,12 @@ class DeepSeekV4DSparkMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
     def precompute_and_store_context_kv(
         self, context_states, context_positions, context_slot_mapping=None, context_request_slots=None
     ) -> None:
-        self.model.precompute_and_store_context_kv(context_states, context_positions, context_slot_mapping)
+        self.model.precompute_and_store_context_kv(
+            context_states,
+            context_positions,
+            context_slot_mapping,
+            context_request_slots,
+        )
 
     def reset_request_slots(self, request_slots: torch.Tensor | None) -> None:
         self.model.reset_request_slots(request_slots)
