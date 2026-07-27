@@ -378,6 +378,7 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         device: torch.device,
         batch_size: int,
         draft_len: int,
+        context_lens: torch.Tensor | None = None,
     ) -> DSparkFusedAttentionMetadata:
         total_tokens = self.window_size + draft_len
         blocks_per_request = (total_tokens + self.pa_block_size - 1) // self.pa_block_size
@@ -393,15 +394,27 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             self.window_size,
         )
         cached = self._dspark_fused_attn_metadata_cache.get(key)
-        if cached is not None:
-            return cached
-        block_table = torch.arange(
-            batch_size * blocks_per_request,
-            dtype=torch.int32,
-            device=device,
-        ).view(batch_size, blocks_per_request)
-        seqused_kv = torch.full((batch_size,), total_tokens, dtype=torch.int32, device=device)
-        metadata = self.dspark_sparse_attn_metadata_op(
+        if cached is None:
+            block_table = torch.arange(
+                batch_size * blocks_per_request,
+                dtype=torch.int32,
+                device=device,
+            ).view(batch_size, blocks_per_request)
+            seqused_kv = torch.empty((batch_size,), dtype=torch.int32, device=device)
+            metadata = None
+        else:
+            _, block_table, seqused_kv, metadata = cached
+
+        if context_lens is None:
+            seqused_kv.fill_(total_tokens)
+        else:
+            seqused_kv.copy_(
+                context_lens[:batch_size]
+                .to(device=device, dtype=torch.int32)
+                .clamp(min=0, max=self.window_size)
+                .add(draft_len)
+            )
+        current_metadata = self.dspark_sparse_attn_metadata_op(
             num_heads_q=self.n_local_heads,
             num_heads_kv=1,
             head_dim=self.head_dim,
@@ -420,8 +433,18 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             has_ori_kv=True,
             has_cmp_kv=False,
         )
+        if metadata is None:
+            metadata = current_metadata
+        else:
+            if metadata.shape != current_metadata.shape:
+                raise RuntimeError(
+                    "DSpark fused attention metadata shape changed for a cached graph input: "
+                    f"cached={metadata.shape}, current={current_metadata.shape}."
+                )
+            metadata.copy_(current_metadata)
         fused_attention_metadata = (blocks_per_request, block_table, seqused_kv, metadata)
-        self._dspark_fused_attn_metadata_cache[key] = fused_attention_metadata
+        if cached is None:
+            self._dspark_fused_attn_metadata_cache[key] = fused_attention_metadata
         return fused_attention_metadata
 
     def _dspark_attention_from_cache(
@@ -452,11 +475,22 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         total_tokens = self.window_size + draft_len
         blocks_per_request = (total_tokens + self.pa_block_size - 1) // self.pa_block_size
         padded_tokens = blocks_per_request * self.pa_block_size
-        if padded_tokens > total_tokens:
-            pad = draft_kv.new_zeros((batch_size, padded_tokens - total_tokens, self.head_dim))
-            kv = torch.cat([ctx_kv, draft_kv, pad], dim=1)
-        else:
-            kv = torch.cat([ctx_kv, draft_kv], dim=1)
+        context_token_counts = context_cache_valid.sum(dim=1, dtype=torch.int64)
+        context_dst_indices = context_cache_valid.to(torch.int64).cumsum(dim=1).sub_(1).clamp_min_(0)
+        packed_ctx_kv = torch.zeros_like(ctx_kv)
+        packed_ctx_kv.scatter_add_(
+            1,
+            context_dst_indices.unsqueeze(-1).expand(-1, -1, self.head_dim),
+            ctx_kv,
+        )
+        kv = draft_kv.new_zeros((batch_size, padded_tokens, self.head_dim))
+        kv[:, : self.window_size].copy_(packed_ctx_kv)
+        draft_dst_indices = context_token_counts.view(-1, 1) + self._dspark_window_offsets[:, :draft_len]
+        kv.scatter_(
+            1,
+            draft_dst_indices.unsqueeze(-1).expand(-1, -1, self.head_dim),
+            draft_kv,
+        )
         kv = kv.view(batch_size * blocks_per_request, self.pa_block_size, 1, self.head_dim).contiguous()
 
         output = torch.empty_like(q)
@@ -713,12 +747,14 @@ class DeepseekV4DSparkModel(nn.Module):
         device: torch.device,
         batch_size: int,
         draft_len: int,
+        context_lens: torch.Tensor | None = None,
     ) -> DSparkFusedAttentionMetadata:
         first_layer = self.layers[str(self.mtp_start_layer_idx)]
         return first_layer.self_attn._get_dspark_fused_attention_metadata(
             device,
             batch_size,
             draft_len,
+            context_lens,
         )
 
     def sync_context_cache_from_paged(
@@ -858,8 +894,14 @@ class DeepSeekV4DSparkMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         device: torch.device,
         batch_size: int,
         draft_len: int,
+        context_lens: torch.Tensor | None = None,
     ) -> DSparkFusedAttentionMetadata:
-        return self.model.prepare_fused_attention_metadata(device, batch_size, draft_len)
+        return self.model.prepare_fused_attention_metadata(
+            device,
+            batch_size,
+            draft_len,
+            context_lens,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor, spec_step_idx: int = 0) -> torch.Tensor | None:
         if self.lm_head is None:

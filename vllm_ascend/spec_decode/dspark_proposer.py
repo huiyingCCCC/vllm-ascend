@@ -692,10 +692,15 @@ class AscendDSparkProposer(AscendDflashProposer):
         }
 
     def _prepare_dspark_fused_attention_metadata(self, batch_size: int):
+        context_lens = self.positions[: batch_size * self.num_speculative_tokens].view(
+            batch_size,
+            self.num_speculative_tokens,
+        )[:, 0]
         return self.model.prepare_fused_attention_metadata(
             self.device,
             batch_size,
             self.num_speculative_tokens,
+            context_lens,
         )
 
     def _reset_pending_request_slots(self) -> None:
