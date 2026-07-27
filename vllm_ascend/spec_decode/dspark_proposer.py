@@ -263,8 +263,9 @@ class AscendDSparkProposer(AscendDflashProposer):
         self.kernel_block_size = int(kernel_block_size or cache_spec.block_size)
         self.block_size = self.kernel_block_size
         max_num_blocks = (self.max_model_len + self.kernel_block_size - 1) // self.kernel_block_size
-        self._dspark_block_table_buffer = torch.zeros(
+        self._dspark_block_table_buffer = torch.full(
             (self.max_graph_batch_size, max_num_blocks),
+            -1,
             dtype=torch.int32,
             device=self.device,
         )
@@ -457,24 +458,27 @@ class AscendDSparkProposer(AscendDflashProposer):
         if block_table_buffer is None:
             self._dspark_block_table_tensor = block_table
             return
-        block_table_buffer.fill_(-1)
-        if block_table is not None:
-            num_rows = min(block_table.shape[0], block_table_buffer.shape[0])
-            if seq_lens is not None:
-                num_rows = min(num_rows, seq_lens.shape[0])
-            num_cols = min(block_table.shape[1], block_table_buffer.shape[1])
-            block_table_buffer[:num_rows, :num_cols].copy_(block_table[:num_rows, :num_cols])
-            if seq_lens is not None and num_rows > 0:
-                valid_block_counts = torch.div(
-                    seq_lens[:num_rows].to(device=block_table_buffer.device, dtype=torch.int64)
-                    + self.kernel_block_size
-                    - 1,
-                    self.kernel_block_size,
-                    rounding_mode="floor",
-                )
-                block_indices = torch.arange(num_cols, device=block_table_buffer.device).view(1, -1)
-                invalid_blocks = block_indices >= valid_block_counts.view(-1, 1)
-                block_table_buffer[:num_rows, :num_cols].masked_fill_(invalid_blocks, -1)
+        if block_table is None:
+            self._dspark_block_table_tensor = block_table_buffer
+            return
+
+        num_rows = min(block_table.shape[0], block_table_buffer.shape[0])
+        if seq_lens is not None:
+            num_rows = min(num_rows, seq_lens.shape[0])
+        num_cols = min(block_table.shape[1], block_table_buffer.shape[1])
+        active_block_table = block_table_buffer[:num_rows, :num_cols]
+        active_block_table.copy_(block_table[:num_rows, :num_cols])
+        if seq_lens is not None and num_rows > 0:
+            valid_block_counts = torch.div(
+                seq_lens[:num_rows].to(device=block_table_buffer.device, dtype=torch.int64)
+                + self.kernel_block_size
+                - 1,
+                self.kernel_block_size,
+                rounding_mode="floor",
+            )
+            block_indices = torch.arange(num_cols, device=block_table_buffer.device).view(1, -1)
+            invalid_blocks = block_indices >= valid_block_counts.view(-1, 1)
+            active_block_table.masked_fill_(invalid_blocks, -1)
         self._dspark_block_table_tensor = block_table_buffer
 
     def set_inputs_first_pass(
