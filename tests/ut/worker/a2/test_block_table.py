@@ -86,6 +86,15 @@ class TestBlockTableComputeSlotMapping(TestBase):
             block_ids = list(range(i * 4, (i + 1) * 4))  # [0,1,2,3], [4,5,6,7], etc.
             block_table.add_row(block_ids, i)
 
+    def test_multi_group_block_table_reports_group_count(self):
+        from vllm_ascend.worker.block_table import MultiGroupBlockTable
+
+        multi_group_block_table = MultiGroupBlockTable.__new__(MultiGroupBlockTable)
+        multi_group_block_table.block_tables = [MagicMock(), MagicMock()]
+
+        self.assertEqual(len(multi_group_block_table), 2)
+        self.assertIs(multi_group_block_table[1], multi_group_block_table.block_tables[1])
+
     def _test_slot_mapping_for_ranks(self, dcp_world_size, pcp_world_size, cp_kv_cache_interleave_size, test_configs):
         """Helper method to test slot_mapping across multiple ranks
 

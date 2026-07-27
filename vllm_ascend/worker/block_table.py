@@ -431,3 +431,7 @@ class MultiGroupBlockTable:
     def __getitem__(self, idx: int) -> "BlockTable":
         """Returns the BlockTable for the i-th KV cache group."""
         return self.block_tables[idx]
+
+    def __len__(self) -> int:
+        """Returns the number of KV cache group block tables."""
+        return len(self.block_tables)
