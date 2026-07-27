@@ -172,6 +172,7 @@ def store_dspark_context_kv_kernel(
     head_block_idx = tl.program_id(1)
     head_offsets = head_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
     head_valid = head_offsets < head_dim
+    is_first_head_block = head_block_idx == 0
 
     position = tl.load(positions_ptr + token_idx)
     slot = tl.load(slot_mapping_ptr + token_idx)
@@ -214,7 +215,7 @@ def store_dspark_context_kv_kernel(
         tl.store(
             cache_positions_ptr + request_slot * cache_positions_request_stride + ring_offset,
             position,
-            mask=ring_valid & (head_offsets == 0),
+            mask=ring_valid & is_first_head_block,
         )
 
 
@@ -291,6 +292,7 @@ def restore_dspark_context_cache_kernel(
     head_block_idx = tl.program_id(2)
     head_offsets = head_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
     head_valid = head_offsets < head_dim
+    is_first_head_block = head_block_idx == 0
 
     context_len = tl.load(context_lens_ptr + request_idx)
     request_slot = tl.load(request_slots_ptr + request_idx)
@@ -337,7 +339,7 @@ def restore_dspark_context_cache_kernel(
     tl.store(
         cache_positions_ptr + request_slot * cache_positions_request_stride + ring_offset,
         position,
-        mask=restore_required & (head_offsets == 0),
+        mask=restore_required & is_first_head_block,
     )
 
 
