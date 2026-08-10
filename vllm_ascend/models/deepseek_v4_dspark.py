@@ -27,9 +27,10 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
 from vllm_ascend.ops.triton.spec_decode.dspark_cache import dspark_masked_cache_store
-from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp, get_ascend_device_type
+from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp, get_ascend_device_type, npu_stream_switch
 
 from .deepseek_v4 import (
     DSV4_STACKED_PARAMS_MAPPING,
@@ -45,6 +46,15 @@ DSPARK_DEFAULT_BLOCK_SIZE = 5
 DSPARK_DEFAULT_NUM_LAYERS = 3
 DSPARK_SAS_OP_NAMESPACES = ("_ascend_dsv4", "_ascend_v4", "custom")
 DSparkFusedAttentionMetadata = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
+
+_DSV4_DSPARK_OVERLAP_STREAM = None
+
+
+def dsv4_dspark_overlap_stream() -> torch.npu.Stream:
+    global _DSV4_DSPARK_OVERLAP_STREAM
+    if _DSV4_DSPARK_OVERLAP_STREAM is None:
+        _DSV4_DSPARK_OVERLAP_STREAM = torch_npu.npu.Stream()
+    return _DSV4_DSPARK_OVERLAP_STREAM
 
 
 @dataclass
@@ -216,11 +226,95 @@ direct_register_custom_op(
 )
 
 
+def dspark_qkv_projection(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_output: torch.Tensor,
+    shared_kv_output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    forward_context = get_forward_context()
+    dsa_layer = forward_context.no_compile_layers[layer_name]
+    dsa_impl = dsa_layer.dsa_attn.impl
+    main_stream = torch.npu.current_stream()
+    kv_stream = dsv4_dspark_overlap_stream()
+    projection_events = getattr(dsa_impl, "_dspark_projection_events", None)
+    if projection_events is None:
+        raise RuntimeError("DSpark projection events are unavailable while multistream projection is enabled.")
+    projection_start, kv_done = projection_events
+
+    hidden_states.record_stream(kv_stream)
+    positions.record_stream(kv_stream)
+    cos.record_stream(kv_stream)
+    sin.record_stream(kv_stream)
+
+    # Match the DSpark recipe: finish Q-A first, then overlap the complete Q-B
+    # and KV projection branches. Join once after both RoPE outputs are ready.
+    q_a = dsa_impl.wq_a(hidden_states)
+    projection_start.record()
+    with npu_stream_switch(kv_stream):
+        torch.npu.current_stream().wait_event(projection_start)
+        shared_kv = dsa_impl.kv_norm(dsa_impl.wkv(hidden_states))
+        shared_kv = _apply_dsv4_rope(
+            dsa_impl,
+            positions,
+            shared_kv,
+            cos_sin=(cos, sin),
+            partial_slice=[dsa_impl.nope_head_dim, dsa_impl.head_dim],
+        ).contiguous()
+        shared_kv.record_stream(main_stream)
+        kv_done.record()
+
+    qr = dsa_impl.q_norm(q_a)
+    q = dsa_impl.wq_b(qr).view(-1, dsa_impl.n_local_heads, dsa_impl.head_dim)
+    q = dsa_impl.q_norm_without_weight(q)
+    q = _apply_dsv4_rope(
+        dsa_impl,
+        positions,
+        q,
+        cos_sin=(cos, sin),
+        partial_slice=[dsa_impl.nope_head_dim, dsa_impl.head_dim],
+    )
+    main_stream.wait_event(kv_done)
+    q_output.copy_(q)
+    shared_kv_output.copy_(shared_kv)
+
+
+def dspark_qkv_projection_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_output: torch.Tensor,
+    shared_kv_output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="dspark_qkv_projection",
+    op_func=dspark_qkv_projection,
+    mutates_args=["q_output", "shared_kv_output"],
+    fake_impl=dspark_qkv_projection_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
 class DeepseekV4DSparkAttention(DeepseekV4Attention):
     def __init__(self, *args, **kwargs) -> None:
         vllm_config = kwargs["vllm_config"]
         config = kwargs["config"]
         super().__init__(*args, **kwargs)
+        self.multistream_dsv4_dspark_overlap = get_ascend_config().multistream_dsv4_dspark_overlap
+        if self.multistream_dsv4_dspark_overlap:
+            dsv4_dspark_overlap_stream()
+            self.dsa_attn.dsa_attn.impl._dspark_projection_events = (
+                torch.npu.Event(),
+                torch.npu.Event(),
+            )
         importlib.import_module("ascend_ops")
         self.dspark_sparse_attn_op = _get_dspark_sas_op("npu_sparse_attn_sharedkv")
         self.dspark_sparse_attn_metadata_op = _get_dspark_sas_op("npu_sparse_attn_sharedkv_metadata")
@@ -303,6 +397,43 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             cos_sin=rope_cos_sin,
             partial_slice=[self.nope_head_dim, self.head_dim],
         ).contiguous()
+
+    def _project_q(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        qr = self.q_norm(self.wq_a(hidden_states))
+        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+        q = self.q_norm_without_weight(q)
+        return _apply_dsv4_rope(
+            self.rotary_emb,
+            positions,
+            q,
+            cos_sin=rope_cos_sin,
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
+
+    def _project_q_kv_multistream(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        q = hidden_states.new_empty((num_tokens, self.n_local_heads, self.head_dim))
+        shared_kv = hidden_states.new_empty((num_tokens, self.head_dim))
+        torch.ops.vllm.dspark_qkv_projection(
+            hidden_states,
+            positions,
+            rope_cos_sin[0],
+            rope_cos_sin[1],
+            q,
+            shared_kv,
+            self.dsa_attn.prefix,
+        )
+        return q, shared_kv
 
     def _validate_paged_cache_contract(
         self,
@@ -535,17 +666,11 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         context_cache_valid = dspark_metadata.context_cache_valid
         context_request_slots = dspark_metadata.context_request_slots
         padding_kv = dspark_metadata.padding_kv
-        qr = self.q_norm(self.wq_a(hidden_states))
-        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-        q = self.q_norm_without_weight(q)
-        q = _apply_dsv4_rope(
-            self.rotary_emb,
-            positions,
-            q,
-            cos_sin=rope_cos_sin,
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-        shared_kv = self._project_shared_kv(hidden_states, positions, rope_cos_sin)
+        if self.multistream_dsv4_dspark_overlap:
+            q, shared_kv = self._project_q_kv_multistream(hidden_states, positions, rope_cos_sin)
+        else:
+            q = self._project_q(hidden_states, positions, rope_cos_sin)
+            shared_kv = self._project_shared_kv(hidden_states, positions, rope_cos_sin)
         if positions.numel() % self.block_size != 0:
             raise ValueError(
                 f"DSpark decode requires a multiple of block_size tokens, got "
