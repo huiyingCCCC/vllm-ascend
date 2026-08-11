@@ -205,6 +205,20 @@ class AscendDSparkProposer(AscendDflashProposer):
                 self._dspark_pd_handoff_warmup_steps,
             )
 
+    def _mark_context_cache_refresh_slots(
+        self,
+        scheduler_output: SchedulerOutput | None,
+        batch_size: int,
+    ) -> None:
+        self._register_pd_handoff_warmup(scheduler_output, batch_size)
+        refresh_req_ids = set(self._dspark_pd_handoff_warmup_remaining)
+        if scheduler_output is not None:
+            refresh_req_ids.update(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+        for req_id in refresh_req_ids:
+            slot = self._dspark_req_id_to_slot.get(req_id)
+            if slot is not None and slot not in self._dspark_slots_to_reset:
+                self._dspark_slots_to_reset.append(slot)
+
     def _consume_pd_handoff_warmup(self, batch_size: int) -> bool:
         if not self._dspark_pd_handoff_warmup_remaining:
             return False
@@ -922,8 +936,8 @@ class AscendDSparkProposer(AscendDflashProposer):
             forward_context = get_forward_context()
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
+            self._mark_context_cache_refresh_slots(scheduler_output, actual_num_reqs)
             self._prepare_dspark_context_cache()
-            self._register_pd_handoff_warmup(scheduler_output, actual_num_reqs)
             if is_prefill:
                 return common_attn_metadata.num_reqs.new_zeros(
                     common_attn_metadata.num_reqs,

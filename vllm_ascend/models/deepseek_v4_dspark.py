@@ -29,7 +29,10 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
-from vllm_ascend.ops.triton.spec_decode.dspark_cache import dspark_masked_cache_store
+from vllm_ascend.ops.triton.spec_decode.dspark_cache import (
+    dspark_incremental_cache_sync,
+    dspark_masked_cache_store,
+)
 from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp, get_ascend_device_type, npu_stream_switch
 
 from .deepseek_v4 import (
@@ -512,8 +515,6 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         cache_valid = position_valid & table_valid & (block_ids >= 0) & (block_ids < kv_cache.shape[0])
         safe_block_ids = block_ids.clamp(min=0, max=kv_cache.shape[0] - 1)
         block_offsets = context_positions.clamp_min(0).remainder(cache_block_size)
-        slot_indices = request_slots.view(-1, 1).expand_as(context_positions)
-        cache_indices = context_positions.remainder(self.window_size)
         masked_context_positions = torch.where(
             cache_valid,
             context_positions.to(torch.int32),
@@ -523,8 +524,7 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             "safe_block_ids": safe_block_ids,
             "block_offsets": block_offsets,
             "cache_valid": cache_valid,
-            "slot_indices": slot_indices,
-            "cache_indices": cache_indices,
+            "request_slots": request_slots,
             "masked_context_positions": masked_context_positions,
             "paged_cache_shape": tuple(kv_cache.shape[:2]),
             "paged_cache_device": kv_cache.device,
@@ -540,27 +540,16 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
             sync_indices["paged_cache_device"],
         )
 
-        paged_tokens = kv_cache.flatten(start_dim=2)
-        context_kv = paged_tokens[
+        dspark_incremental_cache_sync(
+            kv_cache,
+            self._dspark_kv_cache,
+            self._dspark_cache_positions,
             sync_indices["safe_block_ids"],
             sync_indices["block_offsets"],
-            : self.head_dim,
-        ]
-
-        masked_context_kv = torch.where(
-            sync_indices["cache_valid"].unsqueeze(-1),
-            context_kv,
-            torch.zeros_like(context_kv),
-        ).to(self._dspark_kv_cache.dtype)
-        self._dspark_kv_cache[
-            sync_indices["slot_indices"],
-            sync_indices["cache_indices"],
-        ] = masked_context_kv
-
-        self._dspark_cache_positions[
-            sync_indices["slot_indices"],
-            sync_indices["cache_indices"],
-        ] = sync_indices["masked_context_positions"]
+            sync_indices["cache_valid"],
+            sync_indices["request_slots"],
+            sync_indices["masked_context_positions"],
+        )
 
     def _get_dspark_fused_attention_metadata(
         self,

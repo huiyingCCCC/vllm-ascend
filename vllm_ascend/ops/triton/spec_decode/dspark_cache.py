@@ -148,3 +148,153 @@ def dspark_masked_cache_store(
 ) -> None:
     """Store unique valid slots without dynamic-shape indexing."""
     torch.ops.vllm.dspark_masked_cache_store(kv_cache, shared_kv, positions, slot_mapping)
+
+
+@triton.jit
+def dspark_incremental_cache_sync_kernel(
+    paged_cache_ptr,
+    ring_cache_ptr,
+    ring_positions_ptr,
+    block_ids_ptr,
+    block_offsets_ptr,
+    cache_valid_ptr,
+    request_slots_ptr,
+    expected_positions_ptr,
+    paged_cache_stride_block,
+    paged_cache_stride_token,
+    paged_cache_stride_dim,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    NUM_RING_SLOTS: tl.constexpr,
+):
+    entry_idx = tl.program_id(0)
+    batch_idx = entry_idx // WINDOW_SIZE
+    dims = tl.arange(0, BLOCK_DIM)
+    dim_mask = dims < HEAD_DIM
+
+    block_id = tl.load(block_ids_ptr + entry_idx).to(tl.int64)
+    block_offset = tl.load(block_offsets_ptr + entry_idx).to(tl.int64)
+    cache_valid = tl.load(cache_valid_ptr + entry_idx).to(tl.int1)
+    request_slot = tl.load(request_slots_ptr + batch_idx).to(tl.int64)
+    expected_position = tl.load(expected_positions_ptr + entry_idx)
+    ring_index = tl.maximum(expected_position, 0) % WINDOW_SIZE
+
+    slot_valid = (request_slot >= 0) & (request_slot < NUM_RING_SLOTS)
+    safe_request_slot = tl.where(request_slot < 0, 0, request_slot)
+    safe_request_slot = tl.where(safe_request_slot >= NUM_RING_SLOTS, NUM_RING_SLOTS - 1, safe_request_slot)
+    ring_position_offset = safe_request_slot * WINDOW_SIZE + ring_index
+    cached_position = tl.load(ring_positions_ptr + ring_position_offset)
+    cache_miss = cache_valid & slot_valid & (cached_position != expected_position)
+
+    paged_offsets = (
+        block_id * paged_cache_stride_block + block_offset * paged_cache_stride_token + dims * paged_cache_stride_dim
+    )
+    values = tl.load(paged_cache_ptr + paged_offsets, mask=cache_miss & dim_mask, other=0.0)
+    ring_offsets = ring_position_offset * HEAD_DIM + dims
+    tl.store(ring_cache_ptr + ring_offsets, values, mask=cache_miss & dim_mask)
+    # Publish the tag after the KV stores. The following attention runs on the
+    # same stream, so the completed kernel is the cache visibility boundary.
+    tl.store(ring_positions_ptr + ring_position_offset, expected_position, mask=cache_miss)
+
+
+def dspark_incremental_cache_sync_impl(
+    paged_cache: torch.Tensor,
+    ring_cache: torch.Tensor,
+    ring_positions: torch.Tensor,
+    block_ids: torch.Tensor,
+    block_offsets: torch.Tensor,
+    cache_valid: torch.Tensor,
+    request_slots: torch.Tensor,
+    expected_positions: torch.Tensor,
+) -> None:
+    if not HAS_TRITON:
+        raise RuntimeError("DSpark incremental cache sync requires Triton.")
+
+    if (
+        ring_cache.ndim != 3
+        or ring_positions.shape != ring_cache.shape[:2]
+        or not ring_cache.is_contiguous()
+        or not ring_positions.is_contiguous()
+    ):
+        raise ValueError("Invalid DSpark ring cache layout.")
+    if (
+        paged_cache.ndim < 3
+        or any(size != 1 for size in paged_cache.shape[2:-1])
+        or paged_cache.shape[-1] < ring_cache.shape[-1]
+    ):
+        raise ValueError("Invalid DSpark paged cache layout.")
+    index_tensors = (block_offsets, cache_valid, expected_positions)
+    if (
+        block_ids.ndim != 2
+        or any(tensor.shape != block_ids.shape for tensor in index_tensors)
+        or request_slots.numel() != block_ids.shape[0]
+        or ring_cache.shape[1] != block_ids.shape[1]
+        or not all(tensor.is_contiguous() for tensor in (block_ids, *index_tensors, request_slots))
+    ):
+        raise ValueError("Invalid DSpark incremental cache sync indices.")
+
+    head_dim = ring_cache.shape[-1]
+    block_dim = triton.next_power_of_2(head_dim)
+    dspark_incremental_cache_sync_kernel[(block_ids.numel(),)](
+        paged_cache,
+        ring_cache,
+        ring_positions,
+        block_ids,
+        block_offsets,
+        cache_valid,
+        request_slots,
+        expected_positions,
+        paged_cache.stride(0),
+        paged_cache.stride(1),
+        paged_cache.stride(-1),
+        HEAD_DIM=head_dim,
+        BLOCK_DIM=block_dim,
+        WINDOW_SIZE=block_ids.shape[1],
+        NUM_RING_SLOTS=ring_cache.shape[0],
+    )
+
+
+def dspark_incremental_cache_sync_fake(
+    paged_cache: torch.Tensor,
+    ring_cache: torch.Tensor,
+    ring_positions: torch.Tensor,
+    block_ids: torch.Tensor,
+    block_offsets: torch.Tensor,
+    cache_valid: torch.Tensor,
+    request_slots: torch.Tensor,
+    expected_positions: torch.Tensor,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="dspark_incremental_cache_sync",
+    op_func=dspark_incremental_cache_sync_impl,
+    mutates_args=["ring_cache", "ring_positions"],
+    fake_impl=dspark_incremental_cache_sync_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
+def dspark_incremental_cache_sync(
+    paged_cache: torch.Tensor,
+    ring_cache: torch.Tensor,
+    ring_positions: torch.Tensor,
+    block_ids: torch.Tensor,
+    block_offsets: torch.Tensor,
+    cache_valid: torch.Tensor,
+    request_slots: torch.Tensor,
+    expected_positions: torch.Tensor,
+) -> None:
+    """Restore only missing absolute positions from the transferable cache."""
+    torch.ops.vllm.dspark_incremental_cache_sync(
+        paged_cache,
+        ring_cache,
+        ring_positions,
+        block_ids,
+        block_offsets,
+        cache_valid,
+        request_slots,
+        expected_positions,
+    )
