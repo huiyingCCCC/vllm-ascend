@@ -982,7 +982,10 @@ class DeepseekV4DSparkModel(nn.Module):
     def compute_logits(
         self, hidden_states: torch.Tensor, lm_head: ParallelLMHead, logits_processor: LogitsProcessor
     ) -> torch.Tensor:
-        return logits_processor(lm_head, self.norm(self.compute_head_hidden(hidden_states)))
+        # Keep the logits in FP32 for the subsequent Markov-bias addition and
+        # sampling. The LM-head projection itself follows its configured dtype.
+        logits = logits_processor(lm_head, self.norm(self.compute_head_hidden(hidden_states)))
+        return logits if logits.dtype == torch.float32 else logits.float()
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_head.embed(token_ids)
