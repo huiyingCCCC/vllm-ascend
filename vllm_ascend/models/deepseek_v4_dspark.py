@@ -3,7 +3,7 @@
 
 import importlib
 import typing
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -33,6 +33,7 @@ from vllm_ascend.ops.triton.spec_decode.dspark_cache import (
     dspark_incremental_cache_sync,
     dspark_masked_cache_store,
 )
+from vllm_ascend.patch.worker.patch_draft_quarot import get_rotation_path
 from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp, get_ascend_device_type, npu_stream_switch
 
 from .deepseek_v4 import (
@@ -72,6 +73,22 @@ class DSparkDecodeMetadata:
 
 DSparkPagedCacheContract = tuple[tuple[int, int], torch.device]
 DSparkContextSyncIndices = dict[str, typing.Any]
+
+
+def _get_dspark_main_proj_quant_config(vllm_config: VllmConfig, config: PretrainedConfig):
+    draft_quant_config = getattr(config, "quantization_config", None)
+    quant_method = (
+        draft_quant_config.get("quant_method")
+        if isinstance(draft_quant_config, Mapping)
+        else getattr(draft_quant_config, "quant_method", None)
+    )
+    if quant_method == "fp8":
+        return vllm_config.quant_config
+    return None
+
+
+def _uses_dspark_own_vocab_weights(vllm_config: VllmConfig) -> bool:
+    return get_rotation_path(vllm_config) is not None
 
 
 def _get_dspark_sas_op(name: str):
@@ -787,7 +804,17 @@ class DeepseekV4DSparkModel(nn.Module):
         self.target_layer_ids = list(getattr(config, "dspark_target_layer_ids", []) or [])
         self.num_dspark_layers = get_dspark_num_layers(config)
         self.mtp_start_layer_idx = config.num_hidden_layers
-        self.embed_tokens = None
+        self.has_own_embed_tokens = _uses_dspark_own_vocab_weights(vllm_config)
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
+            if self.has_own_embed_tokens
+            else None
+        )
         self.layers = nn.ModuleDict(
             {
                 str(self.mtp_start_layer_idx + idx): DeepseekV4DSparkDecoderLayer(
@@ -803,7 +830,7 @@ class DeepseekV4DSparkModel(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
-            quant_config=vllm_config.quant_config,
+            quant_config=_get_dspark_main_proj_quant_config(vllm_config, config),
             prefix=maybe_prefix(prefix, f"layers.{self.mtp_start_layer_idx}.main_proj"),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1005,9 +1032,19 @@ class DeepSeekV4DSparkMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
-        self.has_own_embed_tokens = False
+        self.rotation_path = get_rotation_path(vllm_config)
+        self.has_own_embed_tokens = self.rotation_path is not None
+        self.has_own_lm_head = self.rotation_path is not None
         self.model = DeepseekV4DSparkModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
-        self.lm_head = None
+        self.lm_head = (
+            ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if self.has_own_lm_head
+            else None
+        )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
         self.set_moe_parameters()
 
@@ -1088,12 +1125,19 @@ class DeepSeekV4DSparkMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         wo_a_dequant_cache: dict[str, dict[str, torch.Tensor]] = {}
 
         for name, loaded_weight in weights:
-            if name in ("embed.weight", "head.weight"):
-                continue
-            mapped_name = self._map_dspark_weight_name(name)
+            if name == "embed.weight":
+                mapped_name = "model.embed_tokens.weight" if self.has_own_embed_tokens else None
+            elif name == "head.weight":
+                mapped_name = "lm_head.weight" if self.has_own_lm_head else None
+            else:
+                mapped_name = self._map_dspark_weight_name(name)
             if mapped_name is None:
                 continue
             name = mapped_name
+            if name == "model.embed_tokens.weight" and not self.has_own_embed_tokens:
+                continue
+            if name == "lm_head.weight" and not self.has_own_lm_head:
+                continue
             if ".confidence_head." in name:
                 continue
 
@@ -1210,6 +1254,10 @@ class DeepSeekV4DSparkMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             f"model.layers.{last_layer_idx}.markov_head.markov_w1.weight",
             f"model.layers.{last_layer_idx}.markov_head.markov_w2.weight",
         }
+        if self.has_own_embed_tokens:
+            required_params.add("model.embed_tokens.weight")
+        if self.has_own_lm_head:
+            required_params.add("lm_head.weight")
         missing_required = sorted(required_params - loaded_params)
         if missing_required:
             raise ValueError(
@@ -1243,6 +1291,11 @@ class DeepSeekV4DSparkMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             return None
         layer_idx = self.config.num_hidden_layers + stage_idx
         suffix = parts[2]
+
+        if stage_idx == 0 and suffix == "embed.weight":
+            return "model.embed_tokens.weight"
+        if stage_idx == self.model.num_dspark_layers - 1 and suffix == "head.weight":
+            return "lm_head.weight"
 
         name = f"model.layers.{layer_idx}.{suffix}"
         return _normalize_dsv4_layer_weight_name(name, preserve_wo_a_scale=True)

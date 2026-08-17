@@ -47,7 +47,7 @@ def get_rotation_path(target_vllm_config):
     try:
         quant_description = target_vllm_config.quant_config.quant_description
         rotation_relative_path = quant_description["optional"]["quarot"]["rotation_map"]["global_rotation"]
-    except KeyError:
+    except (AttributeError, KeyError, TypeError):
         return None
 
     return Path(target_model_path) / rotation_relative_path

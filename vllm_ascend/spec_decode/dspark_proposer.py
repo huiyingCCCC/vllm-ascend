@@ -15,6 +15,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.llm_base_proposer import greedy_sample
+from vllm_ascend.spec_decode.utils import _disable_flash_comm_v1_context
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
 
 DSPARK_MARKOV_PADDING_TOKEN_ID = 0
@@ -754,58 +755,61 @@ class AscendDSparkProposer(AscendDflashProposer):
         block_size = self.num_speculative_tokens
         num_sample = num_reqs * block_size
         sample_hidden_states = hidden_states[:num_sample]
-        head_hidden = self.model.model.compute_head_hidden(sample_hidden_states)
-        base_logits = self.model.compute_logits(head_hidden)
-        vocab_size = base_logits.shape[-1]
-        base_logits = base_logits.view(num_reqs, block_size, vocab_size)
-        use_probabilistic = (
-            sampling_metadata is not None and self._dspark_probabilistic and not sampling_metadata.all_greedy
-        )
-        draft_logits = (
-            torch.empty((num_reqs, block_size, vocab_size), dtype=torch.float32, device=base_logits.device)
-            if use_probabilistic
-            else None
-        )
-        self._dspark_last_draft_logits = None
-        self._dspark_last_draft_probs = None
-        self._dspark_last_req_ids = None
-        prev_ids = self.input_ids[:num_sample].view(num_reqs, block_size)[:, 0].to(torch.int64)
-        if use_probabilistic:
-            assert sampling_metadata is not None
-            draft_idx_mapping = self._get_draft_idx_mapping(num_reqs, base_logits.device)
-            draft_temperature = self._get_draft_sampling_temperature(sampling_metadata, num_reqs, base_logits.device)
-            draft_seeds = self._get_draft_sampling_seeds(sampling_metadata, num_reqs, base_logits.device)
-            gumbel_positions = (
-                self.positions[:num_sample]
-                .view(num_reqs, block_size)
-                .transpose(0, 1)
-                .to(device=base_logits.device, dtype=torch.int32)
-                .sub(1)
-                .contiguous()
+        with _disable_flash_comm_v1_context():
+            head_hidden = self.model.model.compute_head_hidden(sample_hidden_states)
+            base_logits = self.model.compute_logits(head_hidden)
+            vocab_size = base_logits.shape[-1]
+            base_logits = base_logits.view(num_reqs, block_size, vocab_size)
+            use_probabilistic = (
+                sampling_metadata is not None and self._dspark_probabilistic and not sampling_metadata.all_greedy
             )
-        for idx in range(block_size):
-            markov_embed = self.model.markov_embed(prev_ids)
-            markov_bias = self.model.markov_bias(markov_embed)
-            logits = base_logits[:, idx, :] + markov_bias
+            draft_logits = (
+                torch.empty((num_reqs, block_size, vocab_size), dtype=torch.float32, device=base_logits.device)
+                if use_probabilistic
+                else None
+            )
+            self._dspark_last_draft_logits = None
+            self._dspark_last_draft_probs = None
+            self._dspark_last_req_ids = None
+            prev_ids = self.input_ids[:num_sample].view(num_reqs, block_size)[:, 0].to(torch.int64)
             if use_probabilistic:
-                assert sampling_metadata is not None and draft_logits is not None
-                draft_ids = gumbel_sample(
-                    logits.contiguous(),
-                    draft_idx_mapping,
-                    draft_temperature,
-                    draft_seeds,
-                    gumbel_positions[idx],
-                    apply_temperature=True,
-                    output_processed_logits=draft_logits,
-                    output_processed_logits_col=self.arange_dflash[idx],
+                assert sampling_metadata is not None
+                draft_idx_mapping = self._get_draft_idx_mapping(num_reqs, base_logits.device)
+                draft_temperature = self._get_draft_sampling_temperature(
+                    sampling_metadata, num_reqs, base_logits.device
                 )
-            else:
-                draft_ids = greedy_sample(logits)
-            self._dspark_draft_buffer[:num_reqs, idx].copy_(draft_ids)
-            prev_ids = self._dspark_draft_buffer[:num_reqs, idx]
-        if use_probabilistic:
-            assert draft_logits is not None
-            self._dspark_last_draft_logits = draft_logits.contiguous()
+                draft_seeds = self._get_draft_sampling_seeds(sampling_metadata, num_reqs, base_logits.device)
+                gumbel_positions = (
+                    self.positions[:num_sample]
+                    .view(num_reqs, block_size)
+                    .transpose(0, 1)
+                    .to(device=base_logits.device, dtype=torch.int32)
+                    .sub(1)
+                    .contiguous()
+                )
+            for idx in range(block_size):
+                markov_embed = self.model.markov_embed(prev_ids)
+                markov_bias = self.model.markov_bias(markov_embed)
+                logits = base_logits[:, idx, :] + markov_bias
+                if use_probabilistic:
+                    assert sampling_metadata is not None and draft_logits is not None
+                    draft_ids = gumbel_sample(
+                        logits.contiguous(),
+                        draft_idx_mapping,
+                        draft_temperature,
+                        draft_seeds,
+                        gumbel_positions[idx],
+                        apply_temperature=True,
+                        output_processed_logits=draft_logits,
+                        output_processed_logits_col=self.arange_dflash[idx],
+                    )
+                else:
+                    draft_ids = greedy_sample(logits)
+                self._dspark_draft_buffer[:num_reqs, idx].copy_(draft_ids)
+                prev_ids = self._dspark_draft_buffer[:num_reqs, idx]
+            if use_probabilistic:
+                assert draft_logits is not None
+                self._dspark_last_draft_logits = draft_logits.contiguous()
         return self._dspark_draft_buffer[:num_reqs]
 
     def _truncate_dspark_draft_tokens(

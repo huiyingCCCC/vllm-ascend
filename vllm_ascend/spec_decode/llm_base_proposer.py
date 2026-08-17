@@ -470,21 +470,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # some model definition do not define lm_head explicitly
         # and reuse embed_tokens for lm_head, e.g., CohereForCausalLM
         if self.method in ("eagle", "dflash"):
-            # For DFlash drafters trained with a reduced draft vocabulary, the
-            # draft model ships its own lm_head of shape [draft_vocab_size,
-            # hidden] whose rows map to a trained subset of the target vocab via
-            # the draft_id_to_target_id (d2t) buffer. Overwriting it with the
-            # target lm_head ([target_vocab_size, hidden]) makes the draft emit
-            # logits over the wrong vocabulary, so the verifier rejects almost
-            # every speculative token. Keep the draft's own lm_head in that case.
-            draft_has_own_lm_head = (
+            # Some draft models require a checkpoint-specific lm_head, such as
+            # QuaRot DSpark and DFlash with a reduced d2t vocabulary. Replacing
+            # it with the target lm_head changes the draft logits and lowers the
+            # speculative-token acceptance rate.
+            draft_has_own_lm_head = getattr(self.model, "has_own_lm_head", False) or (
                 self.method == "dflash" and getattr(self.model, "draft_id_to_target_id", None) is not None
             )
             if draft_has_own_lm_head:
                 logger.info(
-                    "[spec_decode/base] DFlash draft uses d2t vocab remapping;"
-                    " keeping the draft's own lm_head instead of sharing the target"
-                    " lm_head."
+                    "[spec_decode/base] Draft model provides its own lm_head;"
+                    " keeping it instead of sharing the target lm_head."
                 )
             else:
                 logger.info("[spec_decode/base] Loading EAGLE/DFLASH LM head weights from the target model.")
