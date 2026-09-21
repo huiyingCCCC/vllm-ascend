@@ -76,7 +76,18 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 
         groups = config.kv_cache_groups
-        ids = [i for i, group in enumerate(groups) if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)]
+
+        def is_hidden_state_group(group: Any) -> bool:
+            spec = group.kv_cache_spec
+            if isinstance(spec, HiddenStateCacheSpec):
+                return True
+            inner = getattr(spec, "kv_cache_specs", None)
+            return bool(inner) and all(
+                isinstance(layer_spec, HiddenStateCacheSpec)
+                for layer_spec in inner.values()
+            )
+
+        ids = [i for i, group in enumerate(groups) if is_hidden_state_group(group)]
         if len(ids) == 1:
             return ids[0]
         if not ids and len(groups) == 1:

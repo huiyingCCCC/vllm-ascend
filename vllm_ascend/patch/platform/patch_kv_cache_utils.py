@@ -141,10 +141,14 @@ def group_and_unify_kv_cache_specs(
         return None
 
     ratio_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
+    hidden_state_specs: dict[str, KVCacheSpec] = {}
     grouped_swa_mla_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
             grouped_swa_mla_specs[spec.block_size][name] = spec
+        elif isinstance(spec, HiddenStateCacheSpec):
+            # Keep the cache-only extraction layer out of DSV4 MLA/SWA packing.
+            hidden_state_specs[name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             ratio_specs[spec.compress_ratio][name] = spec
 
@@ -161,7 +165,12 @@ def group_and_unify_kv_cache_specs(
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
 
-    return [*mla_uniform_specs, *swa_uniform_specs]
+    grouped = [*mla_uniform_specs, *swa_uniform_specs]
+    if hidden_state_specs:
+        hidden_uniform = UniformTypeKVCacheSpecs.from_specs(hidden_state_specs)
+        assert hidden_uniform is not None
+        grouped.append(hidden_uniform)
+    return grouped
 
 
 def _get_kv_cache_groups_uniform_groups(
@@ -193,17 +202,33 @@ def _get_kv_cache_groups_uniform_groups(
     # The other uniform KV cache specs will be similarly partitioned into layer tuples.
     # Say we have 21 SWA layers, all with the same page size, then we will have "21"
     # layer tuples.
-    num_layer_tuples_per_group: list[int] = [g_spec.get_num_layer_tuples() for g_spec in grouped_specs]
+    # Hidden-state extraction has its own cache group and must remain outside
+    # the DSV4 MLA/SWA tuple packing below.
+    hidden_specs = [
+        spec
+        for spec in grouped_specs[2:]
+        if all(
+            isinstance(layer_spec, HiddenStateCacheSpec)
+            for layer_spec in spec.kv_cache_specs.values()
+        )
+    ]
+    swa_mla_specs = [spec for spec in grouped_specs[2:] if spec not in hidden_specs]
+    num_layer_tuples_per_group: list[int] = [
+        g_spec.get_num_layer_tuples() for g_spec in grouped_specs[:2] + swa_mla_specs
+    ]
     # Choose `num_layer_tuples` to minimize total padding across groups.
-    num_layer_tuples = _approximate_gcd(num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0])
+    num_layer_tuples = _approximate_gcd(
+        num_layer_tuples_per_group,
+        lower_bound=num_layer_tuples_per_group[0],
+    )
     # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
     num_layer_tuples_per_group = [round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group]
 
     # TODO(cmq): this is not general enough
-    swa_mla_specs = grouped_specs[2:]
-
     assert all(
-        isinstance(spec, SlidingWindowMLASpec) for group in swa_mla_specs for spec in group.kv_cache_specs.values()
+        isinstance(spec, SlidingWindowMLASpec)
+        for group in swa_mla_specs
+        for spec in group.kv_cache_specs.values()
     )
 
     # Split each SWA UniformKV group into smaller groups to align their #(layer tuples)
@@ -253,7 +278,15 @@ def _get_kv_cache_groups_uniform_groups(
                 )
             )
 
-    return [full_mla_group, full_mla_c128_group, *swa_mla_groups]
+    groups = [full_mla_group, full_mla_c128_group, *swa_mla_groups]
+    for hidden_spec in hidden_specs:
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names=list(hidden_spec.kv_cache_specs.keys()),
+                kv_cache_spec=hidden_spec,
+            )
+        )
+    return groups
 
 
 def _get_kv_cache_config_deepseek_v4(
@@ -273,7 +306,18 @@ def _get_kv_cache_config_deepseek_v4(
     per (tuple_idx, bucket) whose shared_by is the union of per-group
     layers at that slot.
     """
-    full_mla_spec = kv_cache_groups[0].kv_cache_spec
+    hidden_groups = [
+        group
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        and all(
+            isinstance(spec, HiddenStateCacheSpec)
+            for spec in group.kv_cache_spec.kv_cache_specs.values()
+        )
+    ]
+    regular_groups = [group for group in kv_cache_groups if group not in hidden_groups]
+
+    full_mla_spec = regular_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
     page_sizes = sorted(full_mla_spec.get_page_sizes())
     layer_tuple_page_bytes = sum(page_sizes)
@@ -283,7 +327,7 @@ def _get_kv_cache_config_deepseek_v4(
     mtp_layer_names = []
     mtp_page_size = 0
     bucketed: list[dict[int, list[str]]] = []
-    for group in kv_cache_groups:
+    for group in regular_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         specs = group.kv_cache_spec.kv_cache_specs
         b: dict[int, list[str]] = defaultdict(list)
@@ -299,9 +343,13 @@ def _get_kv_cache_config_deepseek_v4(
     # full-MLA group this equals the count of layers in the largest
     # per-page-size bucket (= get_num_layer_tuples()); for SWA sub-groups
     # this equals the sub-group size (each has a single page_size).
-    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values()) + len(mtp_layer_names)
+    num_layer_tuples = max(
+        len(layers) for bucket in bucketed for layers in bucket.values()
+    ) + len(mtp_layer_names)
 
-    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+    hidden_page_bytes = sum(group.kv_cache_spec.page_size_bytes for group in hidden_groups)
+    bytes_per_block = layer_tuple_page_bytes * num_layer_tuples + hidden_page_bytes
+    num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
@@ -314,7 +362,24 @@ def _get_kv_cache_config_deepseek_v4(
                     shared_by.append(bucket[tuple_idx])
             kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=shared_by))
     for i in range(len(mtp_layer_names)):
-        kv_cache_tensors.append(KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[mtp_layer_names[i]]))
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=mtp_page_size * num_blocks,
+                shared_by=[mtp_layer_names[i]],
+            )
+        )
+
+    # The extraction cache must not share storage with target-model KV layers:
+    # it is written independently by CacheOnlyAttentionLayer.
+    for group in hidden_groups:
+        for layer_name in group.layer_names:
+            spec = group.kv_cache_spec.kv_cache_specs[layer_name]
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=spec.page_size_bytes * num_blocks,
+                    shared_by=[layer_name],
+                )
+            )
 
     return num_blocks, kv_cache_tensors
 
