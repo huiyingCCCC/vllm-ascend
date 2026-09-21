@@ -464,7 +464,16 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         self.prefix = prefix
         if "wo_a" in prefix:
             hf_config = get_current_vllm_config().model_config.hf_text_config
-            self.n_local_groups = getattr(hf_config, "o_groups", 0) // self.tp_size
+            o_groups = getattr(hf_config, "o_groups", 0)
+            if o_groups <= 0 or o_groups % self.tp_size != 0:
+                raise ValueError(
+                    "DeepSeek-V4 o_groups must be a positive multiple of "
+                    f"tensor parallel size, got o_groups={o_groups}, "
+                    f"tensor_parallel_size={self.tp_size}. "
+                    "Use a compatible TP size (for this checkpoint, TP must "
+                    "divide o_groups)."
+                )
+            self.n_local_groups = o_groups // self.tp_size
             self.o_lora_rank = getattr(hf_config, "o_lora_rank", 0)
 
     def forward(

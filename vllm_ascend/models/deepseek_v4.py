@@ -734,6 +734,14 @@ class DeepseekV4Attention(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.n_groups = config.o_groups
+        if self.n_groups <= 0 or self.n_groups % tp_size != 0:
+            raise ValueError(
+                "DeepSeek-V4 o_groups must be a positive multiple of "
+                f"tensor parallel size, got o_groups={self.n_groups}, "
+                f"tensor_parallel_size={tp_size}. "
+                "Use a compatible TP size (for this checkpoint, TP must "
+                "divide o_groups)."
+            )
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
         self.eps = config.rms_norm_eps
