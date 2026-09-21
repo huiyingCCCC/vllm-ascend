@@ -1134,6 +1134,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
         aux_hidden_states: list[torch.Tensor] = []
+        # DeepSpec uses num_hidden_layers + 1 as an explicit sentinel for the
+        # final hidden state after hc_head and RMSNorm. Decoder-layer IDs keep
+        # their existing 1-based semantics below.
+        final_hidden_capture_id = self.config.num_hidden_layers + 1
+        capture_final_hidden = final_hidden_capture_id in self.aux_hidden_state_layers
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
@@ -1170,6 +1175,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
 
         hidden_states = self.norm(hidden_states)
+        if capture_final_hidden:
+            aux_hidden_states.append(hidden_states)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
