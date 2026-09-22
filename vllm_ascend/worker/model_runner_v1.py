@@ -3875,8 +3875,15 @@ class NPUModelRunner(GPUModelRunner):
                         self.model_config.hf_text_config, name), name)):
                 self.kv_caches.append(kv_caches[layer_name])
             for layer_name, kv_cache in kv_caches.items():
-                self.compilation_config.static_forward_context[
-                    layer_name].kv_cache = [kv_cache]
+                # Ascend MLA layers consume a one-item cache list, while the
+                # upstream extract_hidden_states cache-only implementation
+                # expects its cache to be a tensor. Keep this adaptation in
+                # the Ascend runner so the upstream vLLM tree remains intact.
+                layer = self.compilation_config.static_forward_context[layer_name]
+                if isinstance(layer, CacheOnlyAttentionLayer):
+                    layer.kv_cache = kv_cache
+                else:
+                    layer.kv_cache = [kv_cache]
         else:
             from vllm.v1.worker.utils import bind_kv_cache
 
