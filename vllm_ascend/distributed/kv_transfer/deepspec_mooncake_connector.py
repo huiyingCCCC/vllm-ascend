@@ -179,6 +179,7 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         return self.request_finished(request, block_ids[self._group_id])
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        failed: set[str] = set()
         if self._rank_zero and self._cache is not None:
             metadata = self._get_connector_metadata() if self.has_connector_metadata() else None
             if isinstance(metadata, DeepSpecMooncakeConnectorMetadata):
@@ -189,21 +190,54 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                     hidden = _extract(self._cache, pending.block_ids, self._block_size, pending.token_ids.numel())
                     hidden = hidden.detach().to("cpu").contiguous()
                     token_ids = pending.token_ids.contiguous()
-                    self._store.put_tensor(f"{pending.key}:hidden_states", hidden)
-                    self._store.put_tensor(f"{pending.key}:token_ids", token_ids)
                     manifest = {"version": MANIFEST_VERSION, "status": "ok", "tensors": {
                         "hidden_states": {"shape": list(hidden.shape), "dtype": str(hidden.dtype)},
                         "token_ids": {"shape": list(token_ids.shape), "dtype": str(token_ids.dtype)},
                     }}
-                    result = self._store.put(f"{pending.key}:meta", json.dumps(manifest).encode())
-                    if isinstance(result, int) and result != 0:
-                        raise RuntimeError(f"Mooncake manifest publish failed: {result}")
+                    try:
+                        for name, tensor in (("hidden_states", hidden), ("token_ids", token_ids)):
+                            result = self._store.put_tensor(f"{pending.key}:{name}", tensor)
+                            if isinstance(result, int) and result != 0:
+                                raise RuntimeError(f"Mooncake {name} publish failed: {result}")
+                        result = self._store.put(f"{pending.key}:meta", json.dumps(manifest).encode())
+                        if isinstance(result, int) and result != 0:
+                            raise RuntimeError(f"Mooncake manifest publish failed: {result}")
+                    except Exception as exc:
+                        logger.exception("Mooncake publish failed: request_id=%s handle=%s", pending.req_id, pending.key)
+                        # A failed transfer is terminal too: report it below so
+                        # the scheduler releases the retained cache blocks.
+                        failed.add(pending.req_id)
+                        self._handle_publish_failure(pending, exc)
+                        continue
                     self._published.add(pending.req_id)
         done = set(finished_req_ids)
         done.update(self._published)
+        done.update(failed)
         for req_id in done:
             self._published.discard(req_id)
         return done or None, None
+
+    def _handle_publish_failure(self, pending: PendingSave, error: Exception) -> None:
+        # Both cleanup and failure notification are best-effort: the same
+        # disconnected store node may also make these operations fail.
+        keys = [f"{pending.key}:{name}" for name in ("hidden_states", "token_ids", "meta")]
+        try:
+            results = self._store.batch_remove(keys, force=True)
+            if isinstance(results, int):
+                results = [results]
+            if results is not None and (
+                len(results) != len(keys) or any(isinstance(status, int) and status != 0 for status in results)
+            ):
+                logger.warning("Mooncake partial sample cleanup failed: handle=%s results=%s", pending.key, results)
+        except Exception:
+            logger.exception("Mooncake partial sample cleanup failed: handle=%s", pending.key)
+        try:
+            manifest = {"version": MANIFEST_VERSION, "status": "error", "error": str(error)}
+            result = self._store.put(f"{pending.key}:meta", json.dumps(manifest).encode())
+            if isinstance(result, int) and result != 0:
+                logger.warning("Mooncake failure notification failed: handle=%s status=%s", pending.key, result)
+        except Exception:
+            logger.exception("Mooncake failure notification failed: handle=%s", pending.key)
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
