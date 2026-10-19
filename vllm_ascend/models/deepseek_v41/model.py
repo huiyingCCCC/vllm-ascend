@@ -1553,6 +1553,13 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         pre_mix[:, 0] = 1.0
         last_layer = None
         aux_hidden_states = []
+        # DeepSpec uses the one-past-last layer id as an explicit sentinel for
+        # the final model hidden state. Decoder-layer ids retain their existing
+        # one-based semantics above. The sentinel is intentionally checked
+        # after hc_collapse and the final norm below, so the exported feature
+        # matches ``target_output.last_hidden_state`` used by training.
+        final_hidden_capture_id = getattr(getattr(self, "config", None), "num_hidden_layers", -1) + 1
+        capture_final_hidden = final_hidden_capture_id in self.aux_hidden_state_layers
         for layer in self.layers:
             last_layer = layer
             # DSpark consumes the residual stream entering its configured
@@ -1603,6 +1610,8 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if use_sequence_parallel and self._mtp_hidden_buffer is None:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.norm(hidden_states)
+        if capture_final_hidden:
+            aux_hidden_states.append(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
