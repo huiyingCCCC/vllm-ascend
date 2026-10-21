@@ -4775,7 +4775,15 @@ class NPUModelRunner(GPUModelRunner):
             for name in kv_caches
         ):
             for name in sorted(kv_caches):
-                self.compilation_config.static_forward_context[name].kv_cache = [kv_caches[name]]
+                layer = self.compilation_config.static_forward_context[name]
+                # DSV4.1 attention/compressor layers consume the historical
+                # one-element cache list.  The extract_hidden_states cache
+                # layer uses CacheOnlyAttentionImpl, whose upstream update
+                # path expects the cache itself to be a Tensor.
+                if isinstance(layer, CacheOnlyAttentionLayer):
+                    layer.kv_cache = kv_caches[name]
+                else:
+                    layer.kv_cache = [kv_caches[name]]
                 self.kv_caches.append(kv_caches[name])
         elif self.model_config.hf_text_config.model_type == "deepseek_v4":
             from vllm_ascend.utils import extract_dsv4_layer_index
@@ -4959,6 +4967,9 @@ class NPUModelRunner(GPUModelRunner):
             dict[str, tuple(torch.Tensor, torch.Tensor)] A map between layer names
             to their corresponding memory buffer for K cache and V cache.
         """
+        # Some model-specific cache layouts return before the generic hybrid
+        # detection below. Keep the attribute defined for the reshape path.
+        self.hybrid_with_attn_and_mamba = False
         if self.ascend_config.kvpp_config.size > 1:
             self.hybrid_with_attn_and_mamba = False
             return allocate_kvpp_cache(self.vllm_config, kv_cache_config, self.device)
@@ -5421,7 +5432,10 @@ class NPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = mxfp_cache_views_for_spec(raw, current_kv_cache_spec, kernel_block_size)
                     continue
 
-                if layer_name in layer_tuple_strides:
+                # Hidden-state extraction has a standalone cache layout and
+                # must use the cache-only view below. It is represented by a
+                # tensor descriptor too, but is not an MLA layer tuple.
+                if layer_name in layer_tuple_strides and not is_hidden_state_cache_spec(current_kv_cache_spec):
                     block_stride = layer_tuple_strides[layer_name]
                     initial_offset = 0
                     kv_cache_shape = attn_backend.get_kv_cache_shape(

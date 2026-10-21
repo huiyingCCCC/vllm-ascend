@@ -9,6 +9,7 @@ from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
+    HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
@@ -181,6 +182,10 @@ def get_layer_tuples(specs):
 def group_cache_specs(specs):
     """Merge full-context resources and pad layer tuples without mutating inputs."""
     page_sizes, layer_tuples = get_layer_tuples(specs)
+    hidden = {
+        name: spec for name, spec in specs.items()
+        if isinstance(spec, HiddenStateCacheSpec)
+    }
     padded = {}
     for page_size, layer_tuple in zip(page_sizes, layer_tuples):
         kv_name, index_name, *rest = layer_tuple
@@ -203,6 +208,8 @@ def group_cache_specs(specs):
         UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in mla_names}),
         UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in state_names}),
     ]
+    if hidden:
+        groups.append(UniformTypeKVCacheSpecs.from_specs(hidden))
 
     # Transpose the physical tuples. Each scheduler SWA group takes one layer
     # from every tuple, so its members use distinct slots at the same block ID.
@@ -235,14 +242,25 @@ def make_cache_groups(grouped_specs):
 def _specs_from_groups(groups):
     specs = {}
     for group in groups:
-        for name in group.layer_names:
-            specs[name] = group.kv_cache_spec.kv_cache_specs[name]
+        group_spec = group.kv_cache_spec
+        nested_specs = getattr(group_spec, "kv_cache_specs", None)
+        if nested_specs is not None:
+            for name in group.layer_names:
+                specs[name] = nested_specs[name]
+        else:
+            # vLLM may keep a cache-only hidden-state spec as a direct group
+            # spec instead of wrapping it in UniformTypeKVCacheSpecs.
+            for name in group.layer_names:
+                specs[name] = group_spec
     return specs
 
 
 def get_deepseek_v41_pool_bytes_per_block(groups):
-    page_sizes, _ = get_layer_tuples(_specs_from_groups(groups))
-    return sum(page_sizes)
+    specs = _specs_from_groups(groups)
+    page_sizes, _ = get_layer_tuples(specs)
+    hidden_bytes = sum(spec.page_size_bytes for spec in specs.values()
+                       if isinstance(spec, HiddenStateCacheSpec))
+    return sum(page_sizes) + hidden_bytes
 
 
 def get_deepseek_v41_kv_cache_config(
@@ -251,8 +269,14 @@ def get_deepseek_v41_kv_cache_config(
     available_memory: int,
 ) -> KVCacheConfig:
     """Allocate four independent layer slots backed by one global block-ID pool."""
-    page_sizes, layer_tuples = get_layer_tuples(_specs_from_groups(groups))
-    capacity = max(available_memory // sum(page_sizes), 0)
+    specs = _specs_from_groups(groups)
+    page_sizes, layer_tuples = get_layer_tuples(specs)
+    hidden_specs = {
+        name: spec for name, spec in specs.items()
+        if isinstance(spec, HiddenStateCacheSpec)
+    }
+    bytes_per_block = sum(page_sizes) + sum(spec.page_size_bytes for spec in hidden_specs.values())
+    capacity = max(available_memory // bytes_per_block, 0)
     num_blocks = may_override_num_blocks(vllm_config, capacity)
     tensors: list[KVCacheTensor] = []
     for page_size, layer_names in zip(page_sizes, layer_tuples):
@@ -264,6 +288,16 @@ def get_deepseek_v41_kv_cache_config(
                 offset=0,
                 layer_stride=0,
                 block_stride=page_size,
+            )
+        )
+    for name, spec in hidden_specs.items():
+        tensors.append(
+            KVCacheTensor(
+                size=num_blocks * spec.page_size_bytes,
+                layers=[name],
+                offset=0,
+                layer_stride=0,
+                block_stride=spec.page_size_bytes,
             )
         )
     return KVCacheConfig(

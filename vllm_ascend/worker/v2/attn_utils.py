@@ -1354,7 +1354,10 @@ def _reshape_kv_cache_v2(
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
 
-            if layer_name in layer_tuple_strides:
+            # Hidden-state extraction uses the standalone cache-only layout
+            # handled below; it is not an MLA layer tuple even though the
+            # planner emits a tensor descriptor for it.
+            if layer_name in layer_tuple_strides and not is_hidden_state_cache_spec(kv_cache_spec):
                 # Same view construction as model_runner_v1
                 block_stride = layer_tuple_strides[layer_name]
                 initial_offset = 0
