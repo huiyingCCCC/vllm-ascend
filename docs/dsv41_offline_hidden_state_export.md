@@ -78,16 +78,16 @@ target_last_hidden_states [tokens, hidden_size]
 
 ## vLLM-Ascend 修改
 
-当前分支为 `v0.30.0rc2`，相关提交：
+当前分支为 `v0.30.0rc2`，适配代码已合并为一个提交：
 
 ```text
-40b85a6bb1  feat(dspark): export final DeepSeek V4.1 hidden state
-b74b27b50   feat(dspark): support DeepSeek V4.1 hidden-state export
-7e1e492f0   fix(dspark): handle direct hidden-state cache groups
-ec19db4e8   fix(dspark): bypass backend shape lookup for hidden states
-fed621467   fix(dspark): match hidden-state cache layout
-ed52eb392   fix(worker): initialize hybrid cache layout flag
-32b546f44   fix(dspark): bind hidden-state cache as tensor
+21ad9a356  feat(dspark): support DeepSeek V4.1 offline hidden-state export
+```
+
+文档提交为：
+
+```text
+eb6a96686  docs(dspark): describe DSV4.1 adaptation plan
 ```
 
 ### `vllm_ascend/distributed/kv_transfer/deepspec_mooncake_connector.py`
