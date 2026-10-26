@@ -1,278 +1,252 @@
-# DSV4.1 离线保存 hidden states 适配方案
+# DSV4.1 DSpark 在线训练最小适配方案
 
-本文说明如何在 DSV4 既有 hidden-state 导出机制上适配 DSV4.1，并使用 `vllm-ascend + Mooncake + online` 完成 DSpark 离线特征保存。
+本文以 HuggingFace 的 `DeepSeek-V4-Flash-DSpark/inference` 和
+`DeepSeek-V4.1-Flash/inference` 为模型结构依据，以 online 仓现有 DSV4
+训练实现为代码基础。vLLM-Ascend 只负责 producer 和 hidden-state 传输，
+不把 vLLM 的推理 cache、TP/EP 或 NPU kernel 搬到训练模型中。
 
-## 一、整体适配方案
+## 1. 结论
 
-### 1. 复用 DSV4 的总体链路
+DSV4.1 DSpark 不需要完整重写。online 现有 DSV4 DSpark 的以下部分可以继续使用：
 
-整体链路保持 DSV4 的设计：
+- DSpark block/anchor 采样和 attention mask；
+- `main_proj`、noise token、Markov head、confidence head；
+- CE/L1/tau loss 和 batch collator；
+- online Mooncake 数据接收和 target cache 格式；
+- trainer、FSDP、checkpoint 和 evaluator 框架。
 
-```text
-DSV4.1 target model
-        |
-        | extract_hidden_states
-        v
-CacheOnlyAttentionLayer
-        |
-        | 独立 HiddenStateCacheSpec cache group
-        v
-DeepSpecMooncakeConnector
-        |
-        | Mooncake store
-        v
-prepare_target_cache_vllm.py
-        |
-        v
-manifest.json + samples.idx + shard-*.bin
-        |
-        v
-DSpark training
-```
+需要修改的模型语义主要是 delayed-mHC：
 
-不修改 upstream vLLM 的模型实现，而是在 Ascend 插件侧补齐 DSV4.1 特有的 cache group、cache layout 和 connector 处理。
+1. `hc_pre` 接收上一阶段的 `pre_mix`；
+2. Attention 产生的 `attn_pre` 传给 FFN；
+3. FFN 产生的 `ffn_pre` 传给下一层；
+4. 最后一层使用 `pre_mix + hc_collapse` 得到单路 hidden state。
 
-### 2. 适配 DSV4.1 的差异
+此前方案中列出的 paged KV cache、packed cache、context parallel、TP/EP、Mooncake connector 等属于 vLLM 推理侧，不属于 online DSpark 训练模型，不应作为 online 的改动项。
 
-DSV4.1 适配集中在四点：
+## 2. DSV4.1 与 DSV4 DSpark 的训练结构差异
 
-1. DSV4.1 训练目标层使用 zero-based `[37, 38, 39]`，producer capture id 对应 `[38, 39, 40]`。
-2. 最终 `hc_collapse + norm` hidden state 通过 capture id `41` 单独保存为 verifier target。
-3. hidden-state cache 是单 tensor、独立 cache group，不应套用 DSV4 MLA 的 K/V tuple layout。
-4. vLLM 当前版本的 `CacheOnlyAttentionBackend` 没有 `get_kv_cache_shape()`，因此由 Ascend 侧专用 reshape 分支构造 cache view。
-
-### 3. 数据约定
-
-producer wire 数据为 `[tokens, 4, hidden_size]`。online 侧拆分为：
+### 2.1 DSV4 的层内流程
 
 ```text
-states[:, :3] -> target_hidden_states      [tokens, 3, hidden_size]
-states[:, 3]  -> target_last_hidden_states [tokens, hidden_size]
+hidden_states -> hc_pre -> attention -> hc_post -> hc_pre -> MoE -> hc_post
 ```
 
-前三层随后展平为 `[tokens, 3 * hidden_size]` 写入训练 cache。第 41 个 sentinel 不能拼入前三层训练目标。
+当前 DSV4 layer 对外返回的 `residual` 参数实际会在函数开始处被
+`residual = hidden_states.clone()` 覆盖，跨层传递没有实际作用。有效的
+residual 只是在当前 Attention/MoE 子层内部供 `hc_post` 使用。
 
-## 二、层号映射和配置
+### 2.2 DSV4.1 的层内流程
 
-producer 使用 `extract_hidden_states`，从 cache-only cache 中提取四个 capture：
+```text
+hidden_states + pre_mix
+  -> hc_pre(..., pre_mix) -> attention -> hc_post
+  -> hc_pre(..., attn_pre) -> MoE -> hc_post
+  -> hidden_states + ffn_pre
+```
 
-| Capture ID | 含义 | 最终字段 |
-| ---: | --- | --- |
-| 38 | zero-based decoder layer 37 | `target_hidden_states` 第 1 段 |
-| 39 | zero-based decoder layer 38 | `target_hidden_states` 第 2 段 |
-| 40 | zero-based decoder layer 39 | `target_hidden_states` 第 3 段 |
-| 41 | 最终 `hc_collapse + norm` sentinel | `target_last_hidden_states` |
+训练版接口应从：
 
-训练目标层保持：
+```python
+hidden_states, residual = layer(...)
+```
+
+改为：
+
+```python
+hidden_states, pre_mix = layer(hidden_states, pre_mix, ...)
+```
+
+初始值为：
+
+```python
+pre_mix = hidden_states.new_zeros(tokens, hc_mult, dtype=torch.float32)
+pre_mix[:, 0] = 1.0
+```
+
+### 2.3 最终输出
+
+DSV4 训练模型使用独立 `hc_head` 重新计算最终融合权重。DSV4.1 使用最后
+一层产生的 `pre_mix`：
+
+```python
+final_hidden = (pre_mix.unsqueeze(-1) * hidden_states.float()).sum(-2)
+final_hidden = final_norm(final_hidden)
+```
+
+## 3. hidden-state 数据协议
+
+训练配置使用 zero-based layer id：
 
 ```python
 target_layer_ids = [37, 38, 39]
 ```
 
-因此最终形状为：
+producer 使用 one-based capture id：
 
-```text
-target_hidden_states      [tokens, 3 * hidden_size]
-target_last_hidden_states [tokens, hidden_size]
-```
+| capture id | 内容 |
+| ---: | --- |
+| 38 | decoder layer 37 输出 |
+| 39 | decoder layer 38 输出 |
+| 40 | decoder layer 39 输出 |
+| 41 | 最终 `hc_collapse + norm` 输出 |
 
-## vLLM-Ascend 修改
+前三层拼接为 `target_hidden_states [tokens, 3 * hidden_size]`，第四层单独
+保存为 `target_last_hidden_states [tokens, hidden_size]`。capture id 41 不能
+加入 `target_layer_ids`，它不是 `main_proj` 的输入层。
 
-当前分支为 `v0.30.0rc2`，适配代码已合并为一个提交：
+## 4. online 仓的最小修改
 
-```text
-21ad9a356  feat(dspark): support DeepSeek V4.1 offline hidden-state export
-```
+### 4.1 配置
 
-文档提交为：
-
-```text
-eb6a96686  docs(dspark): describe DSV4.1 adaptation plan
-```
-
-### `vllm_ascend/distributed/kv_transfer/deepspec_mooncake_connector.py`
-
-新增 producer-only `DeepSpecMooncakeConnector`：
-
-1. 识别唯一的 `HiddenStateCacheSpec` group。
-2. 注册 `CacheOnlyAttentionLayer` 的独立 cache tensor。
-3. 请求结束时记录 request、token ids 和 block ids。
-4. 按 cache layout `[blocks, hidden_layers, block_tokens, hidden]` 读取。
-5. 向 Mooncake 发布 `hidden_states`、`token_ids` 和 manifest。
-
-读取方式是：
+新增 DSV4.1 配置，设置：
 
 ```python
-cache[block_ids, :, token_offsets]
+target_layer_ids = [37, 38, 39]
+online_vllm_layer_ids = [38, 39, 40, 41]
+num_draft_layers = 3
+block_size = 5
+mask_token_id = 128799
+online_vllm_model = "dsv41"
 ```
 
-不是普通 attention KV cache 的 K/V tuple 访问方式。
+配置 builder 从 DSV4.1 config 保留 hidden size、HC、attention、MoE 和 RoPE
+字段，并添加 DSpark 字段，不复制 vLLM 的推理 cache 字段。
 
-### `vllm_ascend/models/deepseek_v41/cache_config.py`
+### 4.2 训练模型
 
-- 引入并识别 `HiddenStateCacheSpec`。
-- 把 hidden-state spec 从 DSV4.1 MLA/full-context tuple 中分离。
-- 支持直接的 hidden-state group，不访问不存在的 `kv_cache_specs` 属性。
-- 为 hidden-state cache 创建独立 `KVCacheTensor` descriptor。
-- 将 hidden-state page bytes 纳入每 block 容量计算。
+优先在现有 `deepspec/modeling/dspark/deepseek_v4/modeling.py` 上抽象
+delayed-mHC，而不是复制整个模型目录：
 
-### `vllm_ascend/worker/model_runner_v1.py`
+- 为 decoder layer 增加可选 `pre_mix` 输入；
+- 返回新的 `pre_mix`，不再把无效的跨层 residual 当作状态；
+- 保留当前 PyTorch/SDPA、autograd、FSDP 和 NPU fallback；
+- 增加 DSV4.1 的 `hc_collapse` 最终输出；
+- 只有在 HuggingFace DSV4.1 inference 的 Q/K/V、RoPE、MoE 数学结构确实
+  与 DSV4 不同时，才修改对应训练模块。
 
-- hidden-state layer 绕过普通 MLA tuple reshape，使用单 tensor view：
-  `[num_blocks, num_hidden_state_layers, block_size, hidden_size]`。
-- 初始化 `hybrid_with_attn_and_mamba=False`，避免特殊 allocation 提前返回后 reshape 访问未初始化属性。
-- DSV4.1 attention/compressor layer 仍绑定单元素 list；`CacheOnlyAttentionLayer` 绑定裸 Tensor：
+不能因为 vLLM 中存在 `DeepseekV41Attention` 就直接复制它；vLLM 类依赖
+推理 cache 和并行运行时，训练版只需要 autograd-safe 的等价计算。
+
+### 4.3 trainer/evaluator 和数据链路
+
+复用现有 trainer 的 batch forward、loss、FSDP、embedding/lm_head 冻结、
+checkpoint、proposal 和 confidence 统计。`online_feature_dataset.py` 和
+`target_cache_dataset.py` 已经是模型无关的，只需校验四层 hidden state 并按
+上述协议拆分；loss、collator、shard 格式无需修改。
+
+## 5. vLLM-Ascend 侧
+
+当前 DSV4.1 producer 侧为 vLLM-Ascend 的最小适配，代码改动集中在一个
+commit：
+
+```text
+40b85a6bb1fdf3c7634678027040862441bfd22e
+feat(dspark): export final DeepSeek V4.1 hidden state
+```
+
+改动文件：
+
+```text
+vllm_ascend/models/deepseek_v41/model.py
+```
+
+改动内容是在 DSV4.1 主模型 forward 的最终 `hc_collapse + norm` 之后，支持
+使用 `num_hidden_layers + 1` 作为 final hidden state 的特殊 capture ID：
 
 ```python
-if isinstance(layer, CacheOnlyAttentionLayer):
-    layer.kv_cache = kv_caches[name]
-else:
-    layer.kv_cache = [kv_caches[name]]
+final_hidden_capture_id = config.num_hidden_layers + 1
+capture_final_hidden = (
+    final_hidden_capture_id in self.aux_hidden_state_layers
+)
+...
+hidden_states = self.norm(hidden_states)
+if capture_final_hidden:
+    aux_hidden_states.append(hidden_states)
 ```
 
-最后一项修复了：
+DSV4.1 有 40 个 zero-based decoder layers，因此 producer 的 capture ID 为：
+
+| capture ID | 内容 |
+| ---: | --- |
+| 38 | decoder layer 37 对应的辅助 hidden state |
+| 39 | decoder layer 38 对应的辅助 hidden state |
+| 40 | decoder layer 39 对应的辅助 hidden state |
+| 41 | 最终 `hc_collapse + norm` hidden state |
+
+其中 41 不是第 41 个 decoder layer，而是 `num_hidden_layers + 1` 的 final
+hidden state sentinel。该输出与 online 训练端的
+`target_last_hidden_states` 对应。
+
+producer 侧其余能力直接复用已有实现：
+
+- `extract_hidden_states` speculative method；
+- `HiddenStateCacheSpec`；
+- `DeepSpecMooncakeConnector`；
+- Mooncake TCP 传输；
+- DSV4.1 原有 TP/DP/EP、Engram 和 NPU inference kernel。
+
+因此 online 训练端不需要复制 vLLM 的 paged KV cache、slot mapping、TP/EP
+调度或推理 kernel。vLLM-Ascend 适配的唯一必要改动是让 final hidden state
+进入与前三个辅助 hidden state 相同的传输列表；前三个 decoder hidden state
+仍使用原有 DSV4.1 capture 流程。
+
+### 5.1 HiddenStateCacheSpec、cache planner 与 Mooncake producer
+
+离线 hidden-state 导出还依赖以下 commit：
 
 ```text
-AttributeError: 'list' object has no attribute 'dtype'
+21ad9a356745da9b2d38bcf4622a7c442e57e55b
+feat(dspark): support DeepSeek V4.1 offline hidden-state export
 ```
 
-### `vllm_ascend/worker/v2/attn_utils.py`
-
-v2 reshape 路径同样排除 `HiddenStateCacheSpec`，避免调用当前 upstream 版本没有的：
-
-```python
-CacheOnlyAttentionBackend.get_kv_cache_shape()
-```
-
-没有修改 `/data/c00444317/deepspec/vllm` upstream 源码。
-
-## online 修改
-
-当前 online 分支为 `dsv41`。
-
-### `config/dspark/dspark_deepseek_v41_flash.py`
-
-关键配置：
-
-```python
-block_size=5
-num_draft_layers=3
-target_layer_ids=[37, 38, 39]
-mask_token_id=128799
-num_anchors=512
-```
-
-Mooncake 配置默认 `protocol="tcp"`。`local_hostname` 和 master 地址应通过运行时环境变量或 CLI 显式设置。
-
-### `scripts/serve/launch_vllm_dsv41_deepspec.sh`
-
-启动参数启用：
+这个 commit 与 `40b85a6...` 分工不同：`40b85a6` 让模型 forward 产生最终
+hidden state，`21ad9a356...` 负责把模型产生的四组状态规划到独立 cache，
+从 cache 中取出并发布到 Mooncake。两者共同组成完整链路：
 
 ```text
---tokenizer-mode deepseek_v41
---speculative-config method=extract_hidden_states
---kv-connector DeepSpecMooncakeConnector
---kv-role kv_producer
+DeepseekV41Model forward
+  -> aux_hidden_states [38, 39, 40, 41]
+  -> HiddenStateCacheSpec
+  -> DeepSpecMooncakeConnector
+  -> Mooncake
+  -> online OnlineFeatureDataset
 ```
 
-并固定：
+该 commit 修改了四个文件：
 
-```text
-eagle_aux_hidden_state_layer_ids=[38,39,40,41]
-```
+1. `vllm_ascend/distributed/kv_transfer/deepspec_mooncake_connector.py`
+   新增 `DeepSpecMooncakeConnector`。它是仅写入的 producer connector，
+   从 `CacheOnlyAttentionLayer` 的独立 hidden-state cache 读取每个请求的
+   hidden states 和 token IDs，在 TP rank 0 生成安全的 request key，并通过
+   Mooncake `put_tensor` 发布 `hidden_states`、`token_ids` 以及描述 shape、
+   dtype 和状态的 manifest。发布失败时清理已写入对象并写入 error manifest；
+   它不实现 consumer load。
+2. `vllm_ascend/models/deepseek_v41/cache_config.py`
+   引入 `HiddenStateCacheSpec` 的识别和分组，将 hidden-state cache 从 MLA/
+   普通 state cache 中分离，并在 cache planner 中单独计算每块大小、容量和
+   tensor descriptor。`_specs_from_groups()` 同时兼容嵌套的普通 cache group
+   和直接的 hidden-state group，避免把 hidden-state spec 当作带
+   `kv_cache_specs` 的普通 group 访问。
+3. `vllm_ascend/worker/model_runner_v1.py`
+   让 V1 NPU model runner 正确初始化和传递 cache-only layer 的 Tensor cache，
+   同时为 reshape 路径预先定义 hybrid cache 标志，并跳过 hidden-state
+   standalone layout 的 MLA layer stride 处理。
+4. `vllm_ascend/worker/v2/attn_utils.py`
+   在 V2 cache reshape 中识别 hidden-state cache group，避免将其按 MLA
+   layer tuple 计算 stride，保持 V1/V2 cache layout 行为一致。
 
-### `scripts/data/prepare_target_cache_vllm.py`
+因此，`40b85a6...` 解决“最后一层 hidden state 从哪里产生”，
+`21ad9a356...` 解决“这些状态如何单独分配、提取并传输”。online 训练端只
+消费 Mooncake 中约定的 tensor 和 manifest，不需要实现 vLLM 的 cache planner、
+worker reshape、slot mapping 或 Mooncake producer connector。
 
-脚本逐条请求 producer，从 Mooncake 读取特征，校验 token ids、形状、dtype 和有限性，然后写入 target-cache shard。最终生成：
+## 6. 实施顺序和验收
 
-```text
-manifest.json
-samples.idx
-shard-00000.bin
-```
-
-shard 内每个样本的顺序为：
-
-```text
-input_ids                 int32
-attention_mask            uint8
-loss_mask                 uint8
-target_hidden_states      bfloat16
-target_last_hidden_states bfloat16
-```
-
-`samples.idx` 保存每个字段的 offset，不能单独解析 `shard-00000.bin`。
-
-## 启动和保存流程
-
-```bash
-mooncake_master --port 50051
-```
-
-```bash
-export MOONCAKE_MASTER_SERVER=7.242.97.148:50051
-export MOONCAKE_LOCAL_HOSTNAME=7.242.97.148
-export ASCEND_BASE_PORT=61000
-
-cd /data/c00444317/deepspec/online
-bash scripts/serve/launch_vllm_dsv41_deepspec.sh
-```
-
-另开终端执行：
-
-```bash
-cd /data/c00444317/deepspec/online
-python scripts/data/prepare_target_cache_vllm.py \
-  --config config/dspark/dspark_deepseek_v41_flash.py \
-  --train-data-path train_datasets/ds_v41/perfectblend_train_regen.jsonl \
-  --output-dir "$HOME/.cache/deepspec/dsv41_target_cache" \
-  --endpoint http://127.0.0.1:8077/v1 \
-  --model-name dsv41 \
-  --mooncake-local-hostname "$MOONCAKE_LOCAL_HOSTNAME" \
-  --mooncake-master-server "$MOONCAKE_MASTER_SERVER" \
-  --concurrency 1 \
-  --min-loss-tokens 14 \
-  --validate-outputs \
-  --fail-on-error
-```
-
-`protocol=tcp` 控制 Store 对象传输协议；Ascend Mooncake wheel 仍可能初始化 `AscendDirectTransport`，所以不同服务仍需使用不同 `ASCEND_BASE_PORT`。
-
-## 验证 cache
-
-在 online 仓目录执行：
-
-```bash
-python - <<'PY'
-import os, sys, torch
-sys.path.insert(0, os.getcwd())
-from deepspec.data.target_cache_dataset import CacheDataset
-
-cache = CacheDataset(os.path.expanduser('~/.cache/deepspec/dsv41_target_cache'))
-print('samples:', len(cache))
-print('layers:', cache.target_layer_ids)
-print('hidden_size:', cache.hidden_size)
-assert cache.target_layer_ids == [37, 38, 39]
-sample = cache[0]
-print({k: (tuple(v.shape), str(v.dtype)) for k, v in sample.items()})
-assert sample['target_hidden_states'].shape == (
-    sample['input_ids'].shape[0], 3 * cache.hidden_size)
-assert sample['target_last_hidden_states'].shape == (
-    sample['input_ids'].shape[0], cache.hidden_size)
-assert sample['target_hidden_states'].dtype == torch.bfloat16
-assert sample['target_last_hidden_states'].dtype == torch.bfloat16
-assert torch.isfinite(sample['target_hidden_states'].float()).all()
-assert torch.isfinite(sample['target_last_hidden_states'].float()).all()
-cache.close()
-print('cache validation passed')
-PY
-```
-
-如果只存在 `_tmp/rank_0/shard-local-00000.bin` 和 `samples.local.idx`，说明脚本尚未完成最终合并，不能直接用于训练。
-
-## 已知限制
-
-- 需要匹配的 vLLM、vLLM-Ascend、Mooncake 和 online 分支版本。
-- 当前没有修改 upstream vLLM。
-- 真实 NPU 权重、Mooncake 和完整训练链路需要在目标机器上做端到端验证。
-- 第 41 个 capture 是最后一层 sentinel，不能拼入前三个训练目标层。
+1. 确认 vLLM-Ascend 包含 `40b85a6bb1fdf3c7634678027040862441bfd22e` 和
+   `21ad9a356745da9b2d38bcf4622a7c442e57e55b`。
+2. producer 使用 capture IDs `[38, 39, 40, 41]`。
+3. 确认 online 收到四层状态，前三层拼接为
+   `[tokens, 3 * hidden_size]`，最后一层为 `[tokens, hidden_size]`。
+4. 确认 `main_proj` 的输入维度为 `3 * hidden_size`。
+5. 单卡完成一次 forward/backward，再验证 FSDP、checkpoint 和在线传输。
