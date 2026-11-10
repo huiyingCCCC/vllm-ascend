@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config, replace, set_current_vllm_config
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -23,6 +23,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
+from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
@@ -139,14 +140,34 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         returned config as the current vLLM config. Attention constructors can
         then identify the draft model from ``runner_type="draft"``.
 
-        Keep the target-derived model config otherwise unchanged. Replacing it
-        with ``draft_model_config`` changes how generic proposers construct
-        their layers and can invalidate target parallel settings.
+        Keep the target-derived model config for generic proposers. Standalone
+        DSpark drafts are the exception: their architecture and quantization
+        metadata are independent of the target model and must be used while
+        constructing the draft.
         """
         draft_vllm_config = super()._create_draft_vllm_config()
-        draft_vllm_config = copy.copy(draft_vllm_config)
-        draft_vllm_config.model_config = copy.copy(draft_vllm_config.model_config)
-        draft_vllm_config.model_config.runner_type = self.speculative_config.draft_model_config.runner_type
+        draft_model_config = self.speculative_config.draft_model_config
+        draft_model_path = getattr(draft_model_config, "model", None)
+        target_model_path = getattr(self.vllm_config.model_config, "model", None)
+        is_standalone_dspark = (
+            self.method == "dspark"
+            and draft_model_config is not None
+            and draft_model_path is not None
+            and target_model_path is not None
+            and draft_model_path != target_model_path
+        )
+        if is_standalone_dspark:
+            if not isinstance(getattr(draft_model_config, "hf_overrides", None), dict):
+                draft_model_config.hf_overrides = {}
+            draft_vllm_config = replace(
+                draft_vllm_config,
+                model_config=draft_model_config,
+                quant_config=get_draft_quant_config(draft_vllm_config),
+            )
+        else:
+            draft_vllm_config = copy.copy(draft_vllm_config)
+            draft_vllm_config.model_config = copy.copy(draft_vllm_config.model_config)
+        draft_vllm_config.model_config.runner_type = draft_model_config.runner_type
         return draft_vllm_config
 
     @staticmethod
