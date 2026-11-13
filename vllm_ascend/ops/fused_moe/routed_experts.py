@@ -714,7 +714,18 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
 
         lora_context = getattr(self, "_ascend_moe_lora_context", None)
         moe_comm_method = get_moe_comm_method(_EXTRA_CTX.moe_comm_type, self.moe_config)
-        
+        if moe_comm_method is None:
+            # The draft/MTP MoE path can skip setup_moe_comm_method during
+            # construction, so nothing (not even ALLGATHER) is registered for
+            # its moe_config. Register it on demand and fall back to
+            # ALLGATHER — the correct no-cross-expert communication method for
+            # the non-expert-parallelized draft MoE. moe_comm_type must be
+            # updated to match: downstream code (e.g. the fused top-k router)
+            # branches on moe_comm_type and assumes it agrees with
+            # moe_comm_method.
+            setup_moe_comm_method(self.moe_config)
+            _EXTRA_CTX.moe_comm_type = MoECommType.ALLGATHER
+            moe_comm_method = get_moe_comm_method(MoECommType.ALLGATHER, self.moe_config)
         _EXTRA_CTX.moe_comm_method = moe_comm_method
         assert moe_comm_method is not None
         if lora_context is not None:
