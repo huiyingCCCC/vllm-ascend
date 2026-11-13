@@ -4420,8 +4420,19 @@ class NPUModelRunner(GPUModelRunner):
                     break
             if self.drafter:
                 logger.info("Loading drafter model...")
-                with get_tp_context(self.drafter):
-                    self.drafter.load_model(self.model)
+                # Draft and target DSpark models may have different expert
+                # topologies. Model construction updates the process-wide
+                # MoE communication table, so restore the target table after
+                # loading the standalone draft.
+                from vllm_ascend.ops.fused_moe.moe_comm_method import _MoECommMethods
+
+                saved_moe_comm_methods = dict(_MoECommMethods)
+                try:
+                    with get_tp_context(self.drafter):
+                        self.drafter.load_model(self.model)
+                finally:
+                    _MoECommMethods.clear()
+                    _MoECommMethods.update(saved_moe_comm_methods)
 
             pp_group = get_pp_group()
             should_configure_aux_hidden_states = (

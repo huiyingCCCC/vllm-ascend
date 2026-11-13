@@ -30,7 +30,11 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import Un
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
+from vllm_ascend.ascend_forward_context import (
+    MoECommType,
+    _EXTRA_CTX,
+    use_cann_megamoe,
+)
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
@@ -43,6 +47,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     FusedExpertsResult,
     get_moe_comm_method,
+    setup_moe_comm_method,
 )
 from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
@@ -709,6 +714,18 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
 
         lora_context = getattr(self, "_ascend_moe_lora_context", None)
         moe_comm_method = get_moe_comm_method(_EXTRA_CTX.moe_comm_type, self.moe_config)
+        if moe_comm_method is None:
+            # The draft/MTP MoE path can skip setup_moe_comm_method during
+            # construction, so nothing (not even ALLGATHER) is registered for
+            # its moe_config. Register it on demand and fall back to
+            # ALLGATHER — the correct no-cross-expert communication method for
+            # the non-expert-parallelized draft MoE. moe_comm_type must be
+            # updated to match: downstream code (e.g. the fused top-k router)
+            # branches on moe_comm_type and assumes it agrees with
+            # moe_comm_method.
+            setup_moe_comm_method(self.moe_config)
+            _EXTRA_CTX.moe_comm_type = MoECommType.ALLGATHER
+            moe_comm_method = get_moe_comm_method(MoECommType.ALLGATHER, self.moe_config)
         _EXTRA_CTX.moe_comm_method = moe_comm_method
         assert moe_comm_method is not None
         if lora_context is not None:

@@ -379,6 +379,8 @@ def test_draft_vllm_config_only_propagates_draft_runner_type():
     )
     base_vllm_config = SimpleNamespace(model_config=base_model_config)
     proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+    proposer.method = "eagle"
+    proposer.vllm_config = base_vllm_config
     proposer.speculative_config = SimpleNamespace(
         draft_model_config=draft_model_config,
     )
@@ -398,6 +400,47 @@ def test_draft_vllm_config_only_propagates_draft_runner_type():
     assert draft_vllm_config.model_config.architecture == "target-architecture"
     assert draft_vllm_config.model_config.num_experts == 256
     assert base_model_config.runner_type == "generate"
+
+
+def test_standalone_dspark_uses_draft_model_and_quant_config(monkeypatch):
+    draft_model_config = SimpleNamespace(
+        runner_type="draft",
+        model="/path/to/draft",
+        hf_overrides=None,
+    )
+    target_model_config = SimpleNamespace(
+        runner_type="generate",
+        model="/path/to/target",
+    )
+    base_vllm_config = SimpleNamespace(
+        model_config=target_model_config,
+        quant_config="target-quant",
+    )
+    draft_vllm_config = SimpleNamespace(model_config=target_model_config, quant_config="base-quant")
+    proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+    proposer.method = "dspark"
+    proposer.vllm_config = base_vllm_config
+    proposer.speculative_config = SimpleNamespace(draft_model_config=draft_model_config)
+
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.llm_base_proposer.SpecDecodeBaseProposer._create_draft_vllm_config",
+        lambda _self: draft_vllm_config,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.spec_decode.llm_base_proposer.replace",
+        lambda config, **kwargs: SimpleNamespace(**{**vars(config), **kwargs}),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.spec_decode.llm_base_proposer.get_draft_quant_config",
+        lambda _config: "draft-quant",
+    )
+
+    result = proposer._create_draft_vllm_config()
+
+    assert result.model_config is draft_model_config
+    assert result.quant_config == "draft-quant"
+    assert draft_model_config.hf_overrides == {}
+    assert result.model_config.runner_type == "draft"
 
 
 class TestDisablePaddedDrafterBatchWithFullGraph:

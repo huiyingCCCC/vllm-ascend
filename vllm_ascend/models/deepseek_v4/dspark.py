@@ -97,6 +97,7 @@ class DeepseekV4DSparkModel(nn.Module):
                 str(self.mtp_start_layer_idx + idx): DeepseekV4DecoderLayer(
                     vllm_config,
                     prefix=f"mtp.{idx}",
+                    config=config,
                     is_draft_layer=True,
                 )
                 for idx in range(self.num_dspark_layers)
