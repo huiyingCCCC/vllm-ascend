@@ -115,13 +115,15 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
 
 
 @pytest.mark.parametrize("cp", [False, True])
-def test_v41_draft_routes_to_v41(cp):
+@pytest.mark.parametrize("ratio", [0, 1, 2])
+def test_v41_draft_routes_to_v41(cp, ratio):
     from vllm_ascend.models.deepseek_v41.model import DeepseekV41SWAAttention
 
     draft_backend = SimpleNamespace()
 
     def initialize_base(instance, **kwargs):
         torch.nn.Module.__init__(instance)
+        assert kwargs["use_yarn"] is (ratio > 1)
         instance.compress_ratio = 0
         instance.scale = 512**-0.5
         instance.dsa_attn = SimpleNamespace(dsa_attn=SimpleNamespace(impl=draft_backend))
@@ -139,11 +141,41 @@ def test_v41_draft_routes_to_v41(cp):
             return_value=draft_backend,
         ),
     ):
-        draft = DeepseekV41DSparkAttention(vllm_config=config, prefix="mtp.0.self_attn")
+        draft = DeepseekV41DSparkAttention(
+            vllm_config=config,
+            config=SimpleNamespace(compress_ratio=ratio),
+            prefix="mtp.0.self_attn",
+        )
     assert type(draft.v41_impl) is (AscendDSAV41CPImpl if cp else AscendDSAV41Impl)
     assert config.compilation_config.static_forward_context[draft.v41_layer_name] is draft
     assert draft.packed_cache_ops is draft_backend
     assert draft.softmax_scale == 512**-0.5
+
+
+@pytest.mark.parametrize(
+    ("fields", "stage", "expected"),
+    [
+        ({}, 0, 0),
+        ({"compress_ratio": 2}, 1, 2),
+        ({"compress_ratio": 0, "compress_ratios": [2] * 43}, 0, 0),
+        ({"num_hidden_layers": 40, "compress_ratios": [0] * 40 + [2, 1, 0]}, 0, 2),
+        ({"num_hidden_layers": 40, "compress_ratios": [0] * 40 + [2, 1, 0]}, 1, 1),
+    ],
+)
+def test_dspark_rope_compress_ratio(fields, stage, expected):
+    assert deepseek_v41_dspark_module._get_dspark_compress_ratio(SimpleNamespace(**fields), stage) == expected
+
+
+@pytest.mark.parametrize("ratio", [-1, True, 1.5, "2"])
+def test_dspark_invalid_compress_ratio(ratio):
+    with pytest.raises(ValueError, match="compress_ratio"):
+        deepseek_v41_dspark_module._get_dspark_compress_ratio(SimpleNamespace(compress_ratio=ratio), 0)
+
+
+def test_dspark_compress_ratios_requires_draft_entry():
+    config = SimpleNamespace(num_hidden_layers=40, compress_ratios=[0] * 40)
+    with pytest.raises(ValueError, match="DSpark layer 40"):
+        deepseek_v41_dspark_module._get_dspark_compress_ratio(config, 0)
 
 
 def test_v41_draft_sequence_parallel_shards_inputs_and_restores_output(monkeypatch):

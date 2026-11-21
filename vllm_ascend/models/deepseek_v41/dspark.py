@@ -75,6 +75,22 @@ def _get_dspark_num_mtp_layers(config: PretrainedConfig) -> int:
     return int(num_layers or 3)
 
 
+def _get_dspark_compress_ratio(config: PretrainedConfig, stage_idx: int) -> int:
+    """Resolve draft RoPE geometry, independently of the SWA cache backend."""
+    ratio = getattr(config, "compress_ratio", None)
+    if ratio is None:
+        ratios = getattr(config, "compress_ratios", None)
+        if ratios is None:
+            return 0
+        layer_idx = int(config.num_hidden_layers) + stage_idx
+        if layer_idx >= len(ratios):
+            raise ValueError(f"compress_ratios has no entry for DSpark layer {layer_idx}")
+        ratio = ratios[layer_idx]
+    if isinstance(ratio, bool) or not isinstance(ratio, int) or ratio < 0:
+        raise ValueError(f"compress_ratio must be a non-negative integer, got {ratio!r}")
+    return ratio
+
+
 class DeepseekV41DSparkSWACache(AscendDeepseekV41SWACache):
     """DeepSeek V4.1 DSpark draft SWA cache layer.
 
@@ -104,11 +120,16 @@ class DeepseekV41DSparkAttention(DeepseekV41SWAAttention):
     swa_cache_cls = DeepseekV41DSparkSWACache
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        prefix = kwargs["prefix"]
+        stage_idx = int(prefix.split(".")[-2])
+        ratio = _get_dspark_compress_ratio(kwargs["config"], stage_idx)
+        logger.info("DSpark attention %s: compress_ratio=%s", prefix, ratio)
+        # The draft has no compressor/indexer weights. Select the configured
+        # RoPE base and YaRN tables while retaining the SWA-only cache role.
+        super().__init__(*args, **kwargs, use_yarn=ratio > 1)
         self.packed_cache_ops = DeviceOperator.get_dsv41_packed_cache_ops()
         self.softmax_scale = self.scale
         self.shared_state = None
-        prefix = kwargs["prefix"]
         # Returns (metadata_builder_cls, impl_cls); select the CP-aware implementation.
         self.v41_impl = get_v41_cp_classes()[1](
             prefix=prefix,
