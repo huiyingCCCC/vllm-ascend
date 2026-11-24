@@ -78,6 +78,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.core.scheduler_observability import log_scheduler_queues
 
 
 def _balance_scheduling_enabled(vllm_config) -> bool:
@@ -162,7 +163,9 @@ class BalanceScheduler(Scheduler):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if not self._balance_enabled:
-            return super().schedule(throttle_prefills)
+            scheduler_output = super().schedule(throttle_prefills)
+            log_scheduler_queues(self, scheduler_output)
+            return scheduler_output
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -837,6 +840,7 @@ class BalanceScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        log_scheduler_queues(self, scheduler_output)
         return scheduler_output
 
 
