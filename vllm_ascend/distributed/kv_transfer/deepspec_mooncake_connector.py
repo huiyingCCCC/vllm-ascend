@@ -121,7 +121,7 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self._publish_inflight: set[str] = set()
         self._awaiting_metadata: set[str] = set()
         self._delayed: set[str] = set()
-        self._publish_capacity = 0
+        self._queue_full_count = 0
 
     def _setup_store(self) -> None:
         if self._store is not None or not self._rank_zero:
@@ -145,7 +145,6 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self._publish_queue = queue.Queue(maxsize=writer_count * 2)
         # Include active writer calls in the bound; Queue.maxsize only counts
         # tasks waiting for a worker.
-        self._publish_capacity = self._publish_queue.maxsize + writer_count
         for index in range(writer_count):
             worker = threading.Thread(
                 target=self._publish_worker,
@@ -222,7 +221,6 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             metadata = self._get_connector_metadata() if self.has_connector_metadata() else None
             if isinstance(metadata, DeepSpecMooncakeConnectorMetadata):
                 self._setup_store()
-                rejected: list[PendingSave] = []
                 for pending in metadata.pending_saves:
                     if pending.req_id in self._published or pending.req_id in self._failed:
                         continue
@@ -231,25 +229,9 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                         self._delayed.add(pending.req_id)
                         if pending.req_id not in self._publish_inflight:
                             self._publish_inflight.add(pending.req_id)
-                            if len(self._publish_inflight) > self._publish_capacity:
-                                self._failed.add(pending.req_id)
-                                self._publish_inflight.discard(pending.req_id)
-                                self._delayed.discard(pending.req_id)
-                                logger.error(
-                                    "Mooncake publish queue full: request_id=%s "
-                                    "handle=%s capacity=%d",
-                                    pending.req_id, pending.key, self._publish_capacity,
-                                )
-                                rejected.append(pending)
-                            else:
-                                self._publish_waiting.append(pending)
-                for pending in rejected:
-                    self._handle_publish_failure(
-                        pending,
-                        RuntimeError("Mooncake publish queue is full"),
-                    )
+                            self._publish_waiting.append(pending)
 
-        # Also retry submissions left behind by a previously full queue.
+        # Retry submissions left behind by a full worker queue.
         self._enqueue_waiting()
 
         with self._publish_lock:
@@ -270,6 +252,14 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                         and req_id not in self._awaiting_metadata)
         return done or None, None
 
+    def has_pending_push_work(self) -> bool:
+        with self._publish_lock:
+            waiting = bool(self._publish_waiting or self._publish_inflight)
+        queued = self._publish_queue is not None and not self._publish_queue.empty()
+        if not waiting and not queued:
+            self._queue_full_count = 0
+        return waiting or queued
+
     def _enqueue_waiting(self, *, block: bool = False) -> None:
         if self._publish_queue is None:
             return
@@ -280,6 +270,14 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                 else:
                     self._publish_queue.put_nowait(self._publish_waiting[0])
             except queue.Full:
+                self._queue_full_count += 1
+                if self._queue_full_count == 1 or self._queue_full_count % 100 == 0:
+                    logger.warning(
+                        "Mooncake publish backpressure: queue_depth=%d "
+                        "waiting=%d queue_capacity=%d full_count=%d",
+                        self._publish_queue.qsize(), len(self._publish_waiting),
+                        self._publish_queue.maxsize, self._queue_full_count,
+                    )
                 break
             self._publish_waiting.popleft()
 
