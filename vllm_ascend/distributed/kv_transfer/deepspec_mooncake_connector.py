@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import re
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -108,6 +112,16 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self._requests: dict[str, str] = {}
         self._pending: dict[str, PendingSave] = {}
         self._published: set[str] = set()
+        self._failed: set[str] = set()
+        self._publish_queue: queue.Queue[PendingSave | None] | None = None
+        self._publish_waiting: deque[PendingSave] = deque()
+        self._publish_threads: list[threading.Thread] = []
+        self._publish_lock = threading.Lock()
+        self._stopping = False
+        self._publish_inflight: set[str] = set()
+        self._awaiting_metadata: set[str] = set()
+        self._delayed: set[str] = set()
+        self._publish_capacity = 0
 
     def _setup_store(self) -> None:
         if self._store is not None or not self._rank_zero:
@@ -124,6 +138,22 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if isinstance(result, int) and result != 0:
             raise RuntimeError(f"Mooncake setup failed: status={result}")
+        writer_count = max(1, int(cfg.get("num_writer_threads", 1)))
+        # Keep the queue bounded so producer pressure cannot grow without
+        # limit.  A shared Store is intentional: each extra Store would also
+        # reserve another local_buffer_size region.
+        self._publish_queue = queue.Queue(maxsize=writer_count * 2)
+        # Include active writer calls in the bound; Queue.maxsize only counts
+        # tasks waiting for a worker.
+        self._publish_capacity = self._publish_queue.maxsize + writer_count
+        for index in range(writer_count):
+            worker = threading.Thread(
+                target=self._publish_worker,
+                name=f"deepspec-mooncake-writer-{index}",
+                daemon=True,
+            )
+            worker.start()
+            self._publish_threads.append(worker)
 
     def start_load_kv(self, *args: Any, **kwargs: Any) -> None:
         return None
@@ -174,49 +204,160 @@ class DeepSpecMooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             ids = list(request.prompt_token_ids or [])
         self._pending[req_id] = PendingSave(req_id, key, torch.tensor(ids, dtype=torch.long), list(block_ids))
+        if self._rank_zero:
+            self._delayed.add(req_id)
         return True, {"handle": key}
 
     def request_finished_all_groups(self, request: "Request", block_ids: tuple[list[int], ...]) -> tuple[bool, dict[str, Any] | None]:
         return self.request_finished(request, block_ids[self._group_id])
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
-        failed: set[str] = set()
+        if self._rank_zero:
+            # The scheduler's finished-id notification and connector metadata
+            # can arrive on different iterations. Keep blocks delayed until
+            # the corresponding PendingSave has reached the writer queue.
+            with self._publish_lock:
+                self._awaiting_metadata.update(finished_req_ids)
         if self._rank_zero and self._cache is not None:
             metadata = self._get_connector_metadata() if self.has_connector_metadata() else None
             if isinstance(metadata, DeepSpecMooncakeConnectorMetadata):
                 self._setup_store()
+                rejected: list[PendingSave] = []
                 for pending in metadata.pending_saves:
-                    if pending.req_id in self._published:
+                    if pending.req_id in self._published or pending.req_id in self._failed:
                         continue
-                    hidden = _extract(self._cache, pending.block_ids, self._block_size, pending.token_ids.numel())
-                    hidden = hidden.detach().to("cpu").contiguous()
-                    token_ids = pending.token_ids.contiguous()
-                    manifest = {"version": MANIFEST_VERSION, "status": "ok", "tensors": {
-                        "hidden_states": {"shape": list(hidden.shape), "dtype": str(hidden.dtype)},
-                        "token_ids": {"shape": list(token_ids.shape), "dtype": str(token_ids.dtype)},
-                    }}
-                    try:
-                        for name, tensor in (("hidden_states", hidden), ("token_ids", token_ids)):
-                            result = self._store.put_tensor(f"{pending.key}:{name}", tensor)
-                            if isinstance(result, int) and result != 0:
-                                raise RuntimeError(f"Mooncake {name} publish failed: {result}")
-                        result = self._store.put(f"{pending.key}:meta", json.dumps(manifest).encode())
-                        if isinstance(result, int) and result != 0:
-                            raise RuntimeError(f"Mooncake manifest publish failed: {result}")
-                    except Exception as exc:
-                        logger.exception("Mooncake publish failed: request_id=%s handle=%s", pending.req_id, pending.key)
-                        # A failed transfer is terminal too: report it below so
-                        # the scheduler releases the retained cache blocks.
-                        failed.add(pending.req_id)
-                        self._handle_publish_failure(pending, exc)
-                        continue
-                    self._published.add(pending.req_id)
-        done = set(finished_req_ids)
-        done.update(self._published)
-        done.update(failed)
-        for req_id in done:
-            self._published.discard(req_id)
+                    with self._publish_lock:
+                        self._awaiting_metadata.discard(pending.req_id)
+                        self._delayed.add(pending.req_id)
+                        if pending.req_id not in self._publish_inflight:
+                            self._publish_inflight.add(pending.req_id)
+                            if len(self._publish_inflight) > self._publish_capacity:
+                                self._failed.add(pending.req_id)
+                                self._publish_inflight.discard(pending.req_id)
+                                self._delayed.discard(pending.req_id)
+                                logger.error(
+                                    "Mooncake publish queue full: request_id=%s "
+                                    "handle=%s capacity=%d",
+                                    pending.req_id, pending.key, self._publish_capacity,
+                                )
+                                rejected.append(pending)
+                            else:
+                                self._publish_waiting.append(pending)
+                for pending in rejected:
+                    self._handle_publish_failure(
+                        pending,
+                        RuntimeError("Mooncake publish queue is full"),
+                    )
+
+        # Also retry submissions left behind by a previously full queue.
+        self._enqueue_waiting()
+
+        with self._publish_lock:
+            done = set(self._published)
+            done.update(self._failed)
+            self._published.clear()
+            self._failed.clear()
+            self._delayed.difference_update(done)
+            self._awaiting_metadata.difference_update(done)
+        # A request that has finished generation but has not been published
+        # must remain delayed. Returning finished_req_ids here would release
+        # its blocks before the writer had copied them.
+        if not self._rank_zero:
+            done.update(finished_req_ids)
+        else:
+            done.update(req_id for req_id in finished_req_ids
+                        if req_id not in self._delayed
+                        and req_id not in self._awaiting_metadata)
         return done or None, None
+
+    def _enqueue_waiting(self, *, block: bool = False) -> None:
+        if self._publish_queue is None:
+            return
+        while self._publish_waiting:
+            try:
+                if block:
+                    self._publish_queue.put(self._publish_waiting[0])
+                else:
+                    self._publish_queue.put_nowait(self._publish_waiting[0])
+            except queue.Full:
+                break
+            self._publish_waiting.popleft()
+
+    def _publish_worker(self) -> None:
+        assert self._publish_queue is not None
+        while True:
+            pending = self._publish_queue.get()
+            if pending is None:
+                self._publish_queue.task_done()
+                return
+            try:
+                self._publish_one(pending)
+            except Exception as exc:
+                logger.exception(
+                    "Mooncake publish failed: request_id=%s handle=%s",
+                    pending.req_id, pending.key,
+                )
+                self._handle_publish_failure(pending, exc)
+                with self._publish_lock:
+                    self._failed.add(pending.req_id)
+            else:
+                with self._publish_lock:
+                    self._published.add(pending.req_id)
+            finally:
+                with self._publish_lock:
+                    self._publish_inflight.discard(pending.req_id)
+                self._publish_queue.task_done()
+
+    def _publish_one(self, pending: PendingSave) -> None:
+        started = time.perf_counter()
+        hidden = _extract(
+            self._cache, pending.block_ids, self._block_size, pending.token_ids.numel()
+        )
+        extract_done = time.perf_counter()
+        hidden = hidden.detach().to("cpu").contiguous()
+        copy_done = time.perf_counter()
+        token_ids = pending.token_ids.contiguous()
+        manifest = {"version": MANIFEST_VERSION, "status": "ok", "tensors": {
+            "hidden_states": {"shape": list(hidden.shape), "dtype": str(hidden.dtype)},
+            "token_ids": {"shape": list(token_ids.shape), "dtype": str(token_ids.dtype)},
+        }}
+        for name, tensor in (("hidden_states", hidden), ("token_ids", token_ids)):
+            result = self._store.put_tensor(f"{pending.key}:{name}", tensor)
+            if isinstance(result, int) and result != 0:
+                raise RuntimeError(f"Mooncake {name} publish failed: {result}")
+        tensors_done = time.perf_counter()
+        # Metadata is the ready marker and must be committed last.
+        result = self._store.put(
+            f"{pending.key}:meta", json.dumps(manifest).encode()
+        )
+        if isinstance(result, int) and result != 0:
+            raise RuntimeError(f"Mooncake manifest publish failed: {result}")
+        finished = time.perf_counter()
+        logger.debug(
+            "Mooncake publish timing request_id=%s handle=%s queue_depth=%d "
+            "extract_ms=%.3f copy_ms=%.3f tensors_ms=%.3f meta_ms=%.3f total_ms=%.3f",
+            pending.req_id, pending.key,
+            self._publish_queue.qsize() if self._publish_queue is not None else -1,
+            (extract_done - started) * 1000,
+            (copy_done - extract_done) * 1000,
+            (tensors_done - copy_done) * 1000,
+            (finished - tensors_done) * 1000,
+            (finished - started) * 1000,
+        )
+
+    def shutdown(self) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
+        if self._publish_queue is not None:
+            self._enqueue_waiting(block=True)
+            # Drain queued work before stopping workers.
+            self._publish_queue.join()
+            for _ in self._publish_threads:
+                self._publish_queue.put(None)
+            for worker in self._publish_threads:
+                worker.join(timeout=5.0)
+        self._publish_threads.clear()
 
     def _handle_publish_failure(self, pending: PendingSave, error: Exception) -> None:
         # Both cleanup and failure notification are best-effort: the same
